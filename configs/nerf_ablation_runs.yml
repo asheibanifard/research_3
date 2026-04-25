@@ -1,0 +1,28 @@
+defaults:
+  input: 10-2900-control-cell-05.oif-C0.v3dpbd.tif
+  model_dir: logs/nerf
+  lr: 5e-4
+  epochs: 1000
+  batch_size: 1048576   # 2**20
+  steps_til_summary: 20
+  epochs_til_checkpoint: 20
+  early_stopping_patience: 20
+  wandb_project: nerf-ablation
+  skip_at: 4            # skip connection layer (NeRF paper: layer 4)
+
+runs:
+  # --- baseline (original NeRF architecture) ---
+  - {hidden_layers: 8, hidden_features: 256, L_freq: 10}
+
+  # --- frequency ablation (fix layers=8, width=256) ---
+  - {hidden_layers: 8, hidden_features: 256, L_freq: 4}
+  - {hidden_layers: 8, hidden_features: 256, L_freq: 6}
+  - {hidden_layers: 8, hidden_features: 256, L_freq: 8}
+
+  # --- depth ablation (fix width=256, L_freq=10) ---
+  - {hidden_layers: 4, hidden_features: 256, L_freq: 10}
+  - {hidden_layers: 6, hidden_features: 256, L_freq: 10}
+
+  # --- width ablation (fix layers=8, L_freq=10) ---
+  - {hidden_layers: 8, hidden_features: 128, L_freq: 10}
+  - {hidden_layers: 8, hidden_features: 512, L_freq: 10}

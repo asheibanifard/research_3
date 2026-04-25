@@ -1,0 +1,25 @@
+defaults:
+  input: 10-2900-control-cell-05.oif-C0.v3dpbd.tif
+  model_dir: logs/siren
+  lr: 1e-4
+  epochs: 1000
+  batch_size: 1048576   # 2**20
+  steps_til_summary: 20
+  epochs_til_checkpoint: 20
+  early_stopping_patience: 20
+  wandb_project: siren-ablation
+
+runs:
+  # --- baseline ---
+  - {hidden_layers: 3, hidden_features: 256, omega_0: 30}
+
+  # --- depth ablation (fix width=256, omega=30) ---
+  - {hidden_layers: 4, hidden_features: 256, omega_0: 30}
+
+  # --- width ablation (fix layers=3, omega=30) ---
+  - {hidden_layers: 3, hidden_features: 128, omega_0: 30}
+  - {hidden_layers: 3, hidden_features: 512, omega_0: 30}
+
+  # --- omega ablation (fix layers=3, width=256) ---
+  - {hidden_layers: 3, hidden_features: 256, omega_0: 10}
+  - {hidden_layers: 3, hidden_features: 256, omega_0: 60}
