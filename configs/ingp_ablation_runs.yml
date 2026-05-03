@@ -1,0 +1,45 @@
+defaults:
+  input: 10-2900-control-cell-05.oif-C0.v3dpbd.tif
+  model_dir: logs/ingp
+  lr: 1.0e-3
+  epochs: 500
+  batch_size: 1048576   # 2^20
+  steps_til_summary: 20
+  epochs_til_checkpoint: 20
+  early_stopping_patience: 30
+  wandb_project: ingp-ablation
+  n_levels: 16
+  n_features_per_level: 2
+  log2_hashmap_size: 19
+  base_resolution: 16
+  finest_resolution: 512
+  hidden_layers: 2
+  hidden_features: 64
+
+runs:
+  # --- baseline ---
+  - {}   # h16f2T19_l2n64
+
+  # --- levels ablation  (F=2, T=2^19, l=2, n=64 fixed) ---
+  # More levels = more resolution scales; output dim = L*F
+  - {n_levels: 4}    # h4f2T19_l2n64   enc_dim=8
+  - {n_levels: 8}    # h8f2T19_l2n64   enc_dim=16
+  - {n_levels: 12}   # h12f2T19_l2n64  enc_dim=24
+
+  # --- features-per-level ablation  (L=16, T=2^19, l=2, n=64 fixed) ---
+  # Controls per-level feature width; output dim = L*F
+  - {n_features_per_level: 1}   # h16f1T19_l2n64  enc_dim=16
+  - {n_features_per_level: 4}   # h16f4T19_l2n64  enc_dim=64
+
+  # --- hash-size ablation  (L=16, F=2, l=2, n=64 fixed) ---
+  # Smaller T → more hash collisions; larger T → less collision, more memory
+  - {log2_hashmap_size: 16}   # h16f2T16_l2n64  T=65536   (high collision)
+  - {log2_hashmap_size: 21}   # h16f2T21_l2n64  T=2097152 (low collision)
+
+  # --- MLP depth ablation  (L=16, F=2, T=2^19, n=64 fixed) ---
+  - {hidden_layers: 1}   # h16f2T19_l1n64
+  - {hidden_layers: 4}   # h16f2T19_l4n64
+
+  # --- MLP width ablation  (L=16, F=2, T=2^19, l=2 fixed) ---
+  - {hidden_features: 32}    # h16f2T19_l2n32
+  - {hidden_features: 128}   # h16f2T19_l2n128

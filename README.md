@@ -36,6 +36,57 @@ python src/siren.py \
 | `--no_amp` | off | Disable automatic mixed precision |
 | `--compile` | off | Enable `torch.compile` (requires working Triton/Inductor) |
 
+## 3DGS Config Workflow
+
+`src/3dgs.py` now supports a YAML-first workflow for reproducible runs:
+
+```bash
+python src/3dgs.py --config configs/3dgs.yml
+```
+
+CLI flags still win over YAML values, so you can keep a stable base config and
+override only the fields you want to change for a run:
+
+```bash
+python src/3dgs.py --config configs/3dgs.yml --n_init 20000 --out logs/3dgs/ablation_a
+python src/3dgs.py --config configs/3dgs.yml --no_use_kernel
+```
+
+The config loader expects a YAML mapping and rejects unknown keys. `--volume`
+must be provided either in the YAML file or on the CLI.
+
+Minimal example:
+
+```yaml
+volume: 10-2900-control-cell-05.oif-C0.v3dpbd.tif
+swc_path: 10-2900-control-cell-05.oif-C0.v3dpbd.swc
+out: logs/3dgs/run
+device: cuda
+
+n_init: 10000
+max_gaussians: 50000
+init_scale: 0.05
+init_inten: 0.1
+
+epochs: 500
+steps_per_epoch: 50
+batch: 2048
+chunk_n: 1024
+
+densify_from_step: 500
+densify_until_step: 15000
+densify_interval: 200
+
+lr_means: 1.6e-4
+lr_means_final: 1.6e-6
+lr_scales: 5.0e-3
+lr_quats: 1.0e-3
+lr_inten: 1.0e-2
+
+swc_init: true
+ckpt_interval: 2000
+```
+
 ## Changelog
 
 ### 2026-04-22

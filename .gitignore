@@ -12,6 +12,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+git_clones/
 
 .venv/
 venv/

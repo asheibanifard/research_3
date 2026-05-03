@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Gaussian field fitting — configuration
+# All numerical constants used by the code live here.
+# CLI flags override YAML values:
+#   python src/3dgs.py --config configs/3dgs.yml --n_init 20000
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── I/O ───────────────────────────────────────────────────────────────────────
+volume: 10-2900-control-cell-05.oif-C0.v3dpbd.tif
+swc_path: 10-2900-control-cell-05.oif-C0.v3dpbd.swc
+out:    logs/3dgs/baseline
+device: cuda
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+n_init:          10000   # Gaussians at initialisation
+max_gaussians:   50000   # hard cap after densification
+init_scale:      0.05    # initial isotropic scale in normalised [-1,1]^3
+init_inten:      0.1     # initial intensity amplitude
+
+# ── Training schedule ─────────────────────────────────────────────────────────
+epochs:          500
+steps_per_epoch: 50      # gradient steps per epoch  (total = epochs × steps)
+batch:           2048    # random voxel samples per step
+chunk_n:         1024    # Gaussians per evaluation chunk
+                         # peak memory ≈ batch × chunk_n × 3 × 4 B  ≈ 50 MB
+
+# ── Sampling ────────────────────────────────────────────────────────────────
+swc_init:            true  # initialise Gaussian means from SWC coordinates
+
+# ── Numerical stability ────────────────────────────────────────────────────────
+scale_min_clamp: 1.0e-5  # minimum Gaussian scale (prevents singular covariance)
+mahal_max_clamp: 20.0    # Mahalanobis distance clamp (prevents exp underflow)
+grad_clip_norm:  1.0     # max gradient norm for Gaussian centres
+
+# ── Learning rates ────────────────────────────────────────────────────────────
+# means:  exponential decay  lr_means → lr_means_final
+# others: cosine annealing   lr_X     → lr_X × lr_final_fraction
+lr_means:          1.6e-4
+lr_means_final:    1.6e-6
+lr_scales:         5.0e-3
+lr_quats:          1.0e-3
+lr_inten:          1.0e-2
+lr_final_fraction: 0.01   # cosine annealing floor as fraction of initial LR
+adam_eps:          1.0e-15
+
+# ── Regularisation ────────────────────────────────────────────────────────────
+lambda_scale:    1.0e-4   # L2 on max per-Gaussian scale — prevents bloated blobs
+lambda_sparsity: 1.0e-3   # intensity × (1 − GT) at Gaussian centres — dark-region sparsity
+
+lambda_scale_ceiling: 1.0e-3            # penalty for scales exceeding scale_max_hard
+lambda_scale_outlier: 5.0e-4            # penalty for outlier Gaussians (>3·MAD)
+scale_max_hard: 0.25                    # hard ceiling on per-axis scales
+# ── Adaptive density control ──────────────────────────────────────────────────
+densify_from_step:      500     # start after this many global steps
+densify_until_step:     15000   # stop clone/split/prune after this optimizer step
+densify_interval:       200     # run clone/split/prune every N steps
+densify_grad_thresh:    2.0e-4  # mean |∂L/∂μ| threshold to trigger clone/split
+densify_max_scale:      0.10    # scale boundary: below → clone, above → split
+split_scale_divisor:    1.6     # scale shrink factor applied to split daughters
+log_scale_floor:        -6.0    # minimum log-scale value after a split
+
+# ── Evaluation / logging ──────────────────────────────────────────────────────
+eval_samples:        10000  # foreground voxels used for per-epoch PSNR estimate
+eval_detail_interval: 5     # compute edge/skeleton/MIP metrics every N epochs
+log_interval:        10      # update step-bar postfix every N steps
+ckpt_interval:       2000    # save ckpt_STEP.pth every N optimizer steps

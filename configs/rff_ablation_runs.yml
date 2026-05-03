@@ -1,0 +1,42 @@
+defaults:
+  input: 10-2900-control-cell-05.oif-C0.v3dpbd.tif
+  model_dir: logs/rff
+  lr: 5e-4
+  epochs: 1000
+  batch_size: 1048576   # 2**20
+  steps_til_summary: 20
+  epochs_til_checkpoint: 20
+  early_stopping_patience: 20
+  wandb_project: rff-ablation
+  skip_at: 4
+  hidden_layers: 8
+  hidden_features: 256
+  rff_features: 256
+  rff_scale: 10
+
+runs:
+  # --- baseline (matches NeRF n8256 parameter count as closely as possible) ---
+  - {}   # n8256_m256_s10
+
+  # --- scale ablation  (rff_features=256, layers=8, width=256 fixed) ---
+  # σ controls Gaussian frequency bandwidth: B ~ N(0, σ²I)
+  # Effective max freq ≈ 3σ cycles/unit (3σ rule).
+  # σ=81 → max≈243 ≈ NeRF L=10 (2⁹=512) range  [σ = 512/(2π) ≈ 81]
+  - {rff_scale: 1}    # n8256_m256_s1   → max freq ≈   3  (very smooth)
+  - {rff_scale: 5}    # n8256_m256_s5   → max freq ≈  15
+  - {rff_scale: 30}   # n8256_m256_s30  → max freq ≈  90  ≈ NeRF L=8
+  - {rff_scale: 81}   # n8256_m256_s81  → max freq ≈ 243  ≈ NeRF L=10
+
+  # --- feature-count ablation  (rff_scale=10, layers=8, width=256 fixed) ---
+  # m controls encoding dimensionality (output = 2m + 3)
+  - {rff_features: 64}    # n8256_m64_s10
+  - {rff_features: 128}   # n8256_m128_s10
+  - {rff_features: 512}   # n8256_m512_s10
+
+  # --- depth ablation  (width=256, rff_scale=10, rff_features=256 fixed) ---
+  - {hidden_layers: 4}    # n4256_m256_s10
+  - {hidden_layers: 6}    # n6256_m256_s10
+
+  # --- width ablation  (layers=8, rff_scale=10, rff_features=256 fixed) ---
+  - {hidden_features: 128}   # n8128_m256_s10
+  - {hidden_features: 512}   # n8512_m256_s10

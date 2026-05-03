@@ -190,9 +190,10 @@ def train(
 
     if resume and os.path.exists(resume_path):
         ckpt = torch.load(resume_path, weights_only=False)
-        model.load_state_dict(
-            {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state'].items()}
-        )
+        # Strip _orig_mod. prefix so the dict always has plain keys,
+        # then load into the underlying module directly (bypasses the compile wrapper).
+        plain = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state'].items()}
+        getattr(model, '_orig_mod', model).load_state_dict(plain)
         optim.load_state_dict(ckpt['optim_state'])
         scaler.load_state_dict(ckpt['scaler_state'])
         start_epoch       = ckpt['epoch'] + 1
@@ -201,9 +202,11 @@ def train(
         train_losses      = ckpt['train_losses']
         print(f"Resumed from epoch {ckpt['epoch']}  best_loss={best_loss:.6f}")
     else:
-        if os.path.exists(model_dir):
+        if resume:
+            print(f"Warning: --resume set but no checkpoint found at {resume_path}. Starting fresh.")
+        if not resume and os.path.exists(model_dir):
             shutil.rmtree(model_dir)
-        os.makedirs(model_dir)
+        os.makedirs(model_dir, exist_ok=True)
 
     os.makedirs(os.path.join(model_dir, 'summaries'), exist_ok=True)
     os.makedirs(checkpoints_dir, exist_ok=True)
@@ -327,6 +330,16 @@ def train(
                     tqdm.write(f"Early stopping at epoch {epoch} "
                                f"(no improvement for {early_stopping_patience} epochs)")
                     break
+
+            torch.save({
+                'epoch':             epoch,
+                'model_state':       model.state_dict(),
+                'optim_state':       optim.state_dict(),
+                'scaler_state':      scaler.state_dict(),
+                'best_loss':         best_loss,
+                'epochs_no_improve': epochs_no_improve,
+                'train_losses':      train_losses,
+            }, resume_path)
 
         torch.save(model.state_dict(), ckpt_path('final'))
         np.savetxt(
