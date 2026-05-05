@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# paths.yml — project-wide directory and file paths
+#
+# All paths are relative to the project root (research_3/).
+# Load with:
+#   import yaml
+#   from pathlib import Path
+#   ROOT = Path(__file__).resolve().parent  # or wherever the script lives relative to root
+#   cfg  = yaml.safe_load(open(ROOT / 'configs/paths.yml'))
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  volume:   10-2900-control-cell-05.oif-C0.v3dpbd.tif   # raw input volume (TIF)
+  swc:      10-2900-control-cell-05.oif-C0.v3dpbd.swc   # neuron skeleton (SWC)
+
+# ── Source code ───────────────────────────────────────────────────────────────
+src:
+  root:        src/
+  siren:       src/siren.py
+  nerf:        src/nerf.py
+  rff:         src/rff.py
+  ingp:        src/ingp.py
+  3dgs:        src/_3dgs.py
+  3dgs_train:  src/_3dgs_training.py
+  3dgs_kernel: src/3dgs_eval_cuda.cu
+
+# ── Configs ───────────────────────────────────────────────────────────────────
+configs:
+  root:        configs/
+  3dgs:        configs/3dgs.yml
+  ablation:    configs/ablation_runs.yml
+  nerf_abl:    configs/nerf_ablation_runs.yml
+  rff_abl:     configs/rff_ablation_runs.yml
+  ingp_abl:    configs/ingp_ablation_runs.yml
+  paths:       configs/paths.yml          # this file
+
+# ── Training logs ─────────────────────────────────────────────────────────────
+logs_dir:
+  root:        logs/
+
+  siren:
+    root:      logs/siren/
+    ablation:  logs/siren/ablation/
+    run:       logs/siren/run/             # active training run (checkpoints, log.json, config.json)
+    analysis:  logs/siren/analysis/        # analysis figures and CSVs
+
+  nerf:
+    root:      logs/nerf/
+    ablation:  logs/nerf/ablation/
+    run:       logs/nerf/run/             # active training run (checkpoints, log.json, config.json)
+    analysis:  logs/nerf/analysis/        # analysis figures and CSVs
+  rff:
+    root:      logs/rff/
+    ablation:  logs/rff/ablation/
+    run:       logs/rff/run/             # active training run (checkpoints, log.json, config.json)
+    analysis:  logs/rff/analysis/        # analysis figures and CSVs
+  ingp:
+    root:      logs/ingp/
+    ablation:  logs/ingp/ablation/
+    run:       logs/ingp/run/             # active training run (checkpoints, log.json, config.json)
+    analysis:  logs/ingp/analysis/        # analysis figures and CSVs
+  3dgs:
+    root:      logs/3dgs/
+    ablation:  logs/3dgs/ablation/
+    run:       logs/3dgs/run/             # active training run (checkpoints, log.json, config.json)
+    analysis:  logs/3dgs/analysis/        # analysis figures and CSVs
+
+# ── Best-trained models ────────────────────────────────────────────────────────
+best_trained_dir:
+  root:        best_trained/
+  siren:       best_trained/siren_best.pth
+  nerf:        best_trained/nerf_best.pth
+  rff:         best_trained/rff_best.pth
+  ingp:        best_trained/ingp_best.pth
+  3dgs:        best_trained/3dgs_best.pth
+
+  # pre-computed full-volume reconstructions (normalised float32, shape D×H×W)
+  rec_vol:
+    root:      best_trained/rec_best_vol/
+    siren:     best_trained/rec_best_vol/siren_rec.npy
+    nerf:      best_trained/rec_best_vol/nerf_rec.npy
+    rff:       best_trained/rec_best_vol/rff_rec.npy
+    ingp:      best_trained/rec_best_vol/ingp_rec.npy
+    3dgs:      best_trained/rec_best_vol/3dgs_rec.npy
+
+  # comparison figures
+  plots:
+    profiles:          best_trained/plot_profiles.py
+    profile_z:         best_trained/profile_z.png
+    profile_y:         best_trained/profile_y.png
+    profile_x:         best_trained/profile_x.png
+    profiles_zoom:     best_trained/profiles_zoom.png
+    profile_locations: best_trained/profile_locations.png
+
+# ── Analysis outputs ───────────────────────────────────────────────────────────
+analysis:
+  3dgs:
+    slices:          logs/3dgs/analysis/slices.png
+    mip:             logs/3dgs/analysis/mip.png
+    training_trends: logs/3dgs/analysis/training_trends.png
+    ckpt_metrics:    logs/3dgs/analysis/ckpt_metrics_cache.csv
+
+# ── Reports ────────────────────────────────────────────────────────────────────
+reports:
+  ablation_docx: logs/3dgs/ablation/3dgs_experiment_report.docx
+  ablation_csv:  logs/3dgs/ablation/results.csv
+
+# ── Figures (publication-ready exports) ───────────────────────────────────────
+figures:
+  root:   figures/

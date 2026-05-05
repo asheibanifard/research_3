@@ -1,3 +1,4 @@
+# Python
 *.pyc
 *.pyo
 *.pyd
@@ -14,13 +15,17 @@ __pycache__/
 .ipynb_checkpoints/
 git_clones/
 
+# Environments
 .venv/
 venv/
 env/
 
+# Editors
 .vscode/
 .idea/
+.DS_Store
 
+# Build artifacts
 output/
 build/
 dist/
@@ -28,6 +33,7 @@ dist/
 diff_rasterization/diff_rast.egg-info/
 diff_rasterization/dist/
 
+# Training outputs
 tensorboard_3d/
 screenshots/
 checkpoints/
@@ -35,10 +41,54 @@ logs/
 experiments/
 wandb/
 *.log
+best_trained/
 
-# Large microscopy/source data artifacts
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.pb
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Numpy / array data
+*.npy
+*.npz
+
+# Tabular / columnar data
+*.parquet
+*.arrow
+*.feather
+*.csv
+*.tsv
+
+# Microscopy and large image formats
+*.tif
+*.tiff
 *.v3dpbd.tif
 *.oif
 *.oib
+*.czi
+*.lif
+*.nd2
+*.lsm
 
-.DS_Store
+# Video
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.7z
+*.rar

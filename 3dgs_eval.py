@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from tqdm import tqdm
 
-from src._3dgs import GaussianCloud, AABB, VolumeDataset
+from _3dgs._3dgs import GaussianCloud, AABB, VolumeDataset
 
 
 RUN_DIR = Path('logs/3dgs/run')

@@ -30,7 +30,7 @@ import torch.nn as nn
 from torch.utils.cpp_extension import load
 
 # Reuse the architecture-agnostic training loop and dataset from nerf.py
-from src.nerf import train, NeRFDataset
+from nerf.nerf import train, NeRFDataset
 
 USE_CUDA_KERNEL = False   # toggled by --use_kernel CLI flag
 

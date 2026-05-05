@@ -35,7 +35,7 @@ from torch.utils.cpp_extension import load
 # Training loop lives in a separate module so it can be unit-tested and reused
 # without importing the full model stack.  This file wires all components
 # together and passes them in via dependency injection.
-from src._3dgs_training import train_impl as _train_impl
+from _3dgs._3dgs_training import train_impl as _train_impl
 
 
 # ── CUDA kernel singleton ─────────────────────────────────────────────────────
@@ -56,11 +56,20 @@ def _load_3dgs_kernel():
     """
     global _3dgs_cuda
     if _3dgs_cuda is None:
+        import sys, os
         src = Path(__file__).parent / "3dgs_cuda.cu"
+        # Collect candidate CUDA include dirs (covers pip-installed nvidia packages)
+        cuda_inc_candidates = [
+            Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages" / "nvidia" / "cuda_runtime" / "include",
+            Path(sys.prefix) / "include",
+        ]
+        extra_inc = [str(p) for p in cuda_inc_candidates if (p / "cuda_runtime.h").exists()]
+        extra_flags = ["-O3", "--use_fast_math"] + [f"-I{p}" for p in extra_inc]
         _3dgs_cuda = load(
             name="gaussian_3dgs_cuda",
             sources=[str(src)],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            extra_cuda_cflags=extra_flags,
             verbose=False,
         )
     return _3dgs_cuda

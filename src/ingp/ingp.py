@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
 
-from src.nerf import train, NeRFDataset
+from nerf.nerf import train, NeRFDataset
 
 USE_CUDA_KERNEL = False   # toggled by --use_kernel CLI flag
 
