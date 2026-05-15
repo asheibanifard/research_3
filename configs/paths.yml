@@ -50,16 +50,19 @@ logs_dir:
     ablation:  logs/nerf/ablation/
     run:       logs/nerf/run/             # active training run (checkpoints, log.json, config.json)
     analysis:  logs/nerf/analysis/        # analysis figures and CSVs
+
   rff:
     root:      logs/rff/
     ablation:  logs/rff/ablation/
     run:       logs/rff/run/             # active training run (checkpoints, log.json, config.json)
     analysis:  logs/rff/analysis/        # analysis figures and CSVs
+
   ingp:
     root:      logs/ingp/
     ablation:  logs/ingp/ablation/
     run:       logs/ingp/run/             # active training run (checkpoints, log.json, config.json)
     analysis:  logs/ingp/analysis/        # analysis figures and CSVs
+    
   3dgs:
     root:      logs/3dgs/
     ablation:  logs/3dgs/ablation/

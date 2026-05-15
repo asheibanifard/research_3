@@ -6,21 +6,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
-volume: 10-2900-control-cell-05.oif-C0.v3dpbd.tif
-swc_path: 10-2900-control-cell-05.oif-C0.v3dpbd.swc
-out:    logs/3dgs/baseline
+volume: data/10-2900-control-cell-05.oif-C0.v3dpbd.tif
+swc_path: data/10-2900-control-cell-05.oif-C0.v3dpbd.swc
+out:    logs/3dgs/run13
 device: cuda
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-n_init:          10000   # Gaussians at initialisation
-max_gaussians:   50000   # hard cap after densification
+n_init:          20000   # doubled SWC seed density to pre-populate distal branches
+max_gaussians:   150000  # hard cap after densification
 init_scale:      0.05    # initial isotropic scale in normalised [-1,1]^3
 init_inten:      0.1     # initial intensity amplitude
 
 # ── Training schedule ─────────────────────────────────────────────────────────
-epochs:          500
+epochs:          2000
 steps_per_epoch: 50      # gradient steps per epoch  (total = epochs × steps)
-batch:           2048    # random voxel samples per step
+batch:           4096    # random voxel samples per step
 chunk_n:         1024    # Gaussians per evaluation chunk
                          # peak memory ≈ batch × chunk_n × 3 × 4 B  ≈ 50 MB
 
@@ -44,23 +44,60 @@ lr_final_fraction: 0.01   # cosine annealing floor as fraction of initial LR
 adam_eps:          1.0e-15
 
 # ── Regularisation ────────────────────────────────────────────────────────────
-lambda_scale:    1.0e-4   # L2 on max per-Gaussian scale — prevents bloated blobs
-lambda_sparsity: 1.0e-3   # intensity × (1 − GT) at Gaussian centres — dark-region sparsity
+#
+# Objective: fewest ellipsoids, most fidelity.
+#
+# Full loss (run10):
+#   L = L1(pred,gt) + λ_ssim · SSIM_slice     — reconstruction (GaussianPile L1+SSIM)
+#     + λ_scale    · mean(s_max²)              — bloat penalty
+#     + λ_ceiling  · mean(relu(s_max − cap))   — hard ceiling enforcement
+#     + λ_outlier  · mean(relu(s_max − τ))     — outlier suppression
+#     + λ_sparsity · mean(v_k · (1−GT(μ_k)))  — kill background Gaussians
+#     + λ_aniso    · mean(s_min²)              — collapse short axes → cigar ellipsoids
+#     + λ_count    · mean(σ(raw_inten_k))      — soft-L0 count
+#     + λ_L1       · mean(v_k)                 — L1 intensity: kills zombie Gaussians
+#     + λ_coverage · mean(−log(s_max/s_ref))   — coverage reward (saturates at scale_max_hard)
+#
+# run10 changes vs run9:
+#   - ssim_start_step=35000: SSIM activates only after densification ends so its
+#     positional gradients don't inflate _grad_acc → prevents saturation at 80k cap
+#   - lambda_count: 3e-3 → 1e-3  }  run8 showed combined count+L1+sparsity
+#   - lambda_L1:    2e-3 → 8e-4  }  was too aggressive, collapsing N to 6k
+#
+lambda_scale:    5.0e-5
+lambda_sparsity: 5.0e-3
 
-lambda_scale_ceiling: 1.0e-3            # penalty for scales exceeding scale_max_hard
-lambda_scale_outlier: 5.0e-4            # penalty for outlier Gaussians (>3·MAD)
-scale_max_hard: 0.25                    # hard ceiling on per-axis scales
+lambda_scale_ceiling: 1.0e-3
+lambda_scale_outlier: 5.0e-4
+scale_max_hard: 0.50
+scale_min_hard: 0.008
+
+lambda_aniso:  4.0e-4   # reduced: less Gaussians pinned at s_min floor
+lambda_count:  5.0e-4   # reduced: less intensity suppression → brighter dendrites
+lambda_L1:     3.0e-4   # reduced: recover dendrite brightness, still kills zombies
+lambda_coverage: 1.0e-4
+prune_inten_thresh: 8.0e-3
+
+# ── GaussianPile additions ────────────────────────────────────────────────────
+lambda_ssim:      0.2     # SSIM weight in reconstruction term (GaussianPile default)
+ssim_crop:        64      # random Z-crop side length for SSIM evaluation
+ssim_start_step:  20000   # ep400 — SSIM active for densification refinement phase, matching run11 behaviour
+# PSF-aware z-axis initialisation.
+# GaussianPile's PSF correction applies to 2D slice rendering; for direct 3D
+# voxel regression the optimizer learns z-anisotropy from data.  z_factor=1.0
+# keeps the isotropic init; the aniso + coverage terms then drive elongation.
+init_scale_z_factor: 1.0
 # ── Adaptive density control ──────────────────────────────────────────────────
 densify_from_step:      500     # start after this many global steps
-densify_until_step:     15000   # stop clone/split/prune after this optimizer step
+densify_until_step:     50000   # stop clone/split/prune after this optimizer step (ep1000)
 densify_interval:       200     # run clone/split/prune every N steps
-densify_grad_thresh:    2.0e-4  # mean |∂L/∂μ| threshold to trigger clone/split
-densify_max_scale:      0.10    # scale boundary: below → clone, above → split
+densify_grad_thresh:    2.0e-4  # slightly lower → clone more in dim distal branches
+densify_max_scale:      0.03    # scale boundary: below → clone, above → split
 split_scale_divisor:    1.6     # scale shrink factor applied to split daughters
 log_scale_floor:        -6.0    # minimum log-scale value after a split
 
 # ── Evaluation / logging ──────────────────────────────────────────────────────
-eval_samples:        10000  # foreground voxels used for per-epoch PSNR estimate
+eval_samples:        200000  # foreground voxels used for per-epoch PSNR estimate
 eval_detail_interval: 5     # compute edge/skeleton/MIP metrics every N epochs
 log_interval:        10      # update step-bar postfix every N steps
 ckpt_interval:       2000    # save ckpt_STEP.pth every N optimizer steps

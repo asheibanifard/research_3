@@ -119,172 +119,200 @@ __device__ __forceinline__ void quat_grad_from_rot_grad(
 }
 
 
-// ─── Forward kernel ───────────────────────────────────────────────────────────
+// ─── Forward kernel (shared-memory tiled) ────────────────────────────────────
 /*
- * One thread per sample point m ∈ [0, M).
- * For each m, accumulates contributions from all N Gaussians:
- *   out[m] = Σ_k  gain[k] · inten[k] · exp(-½ · mahal_k)
- * where mahal_k = uᵀ diag(1/s²) u,  u = Rᵀ (pts[m] - means[k]).
- * Gaussians with mahal_k >= mahal_clamp are skipped (exp ≈ 0).
+ * Each block of BLOCK_FWD threads handles BLOCK_FWD sample points.
+ * Gaussians are loaded cooperatively into shared memory TILE_FWD at a time,
+ * reducing global-memory reads by a factor of BLOCK_FWD vs the naïve kernel.
+ *
+ * Shared-mem per block = TILE_FWD × (3+3+4+1+1) × 4 = TILE_FWD × 48 B.
+ * With TILE_FWD=256: 12 288 B — well within the 48 KB limit.
  */
-__global__ void gaussian_forward_kernel(
-        const float* __restrict__ pts,      /* (M,3)  query coordinates      */
-        const float* __restrict__ means,    /* (N,3)  Gaussian centres        */
-        const float* __restrict__ log_s,    /* (N,3)  log per-axis std-devs   */
-        const float* __restrict__ quats,    /* (N,4)  quaternions [w,x,y,z]   */
-        const float* __restrict__ gain,     /* (N,)   amplitude gate (=1)     */
-        const float* __restrict__ inten,    /* (N,)   softplus intensity       */
-        float scale_min,
-        float mahal_clamp,
-        int M, int N,
-        float* __restrict__ out             /* (M,)   output field values      */
-) {
-    const int m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m >= M) return;
+#define BLOCK_FWD 256
+#define TILE_FWD  256
 
-    const float px = pts[m*3+0];
-    const float py = pts[m*3+1];
-    const float pz = pts[m*3+2];
+__global__ void gaussian_forward_kernel(
+        const float* __restrict__ pts,
+        const float* __restrict__ means,
+        const float* __restrict__ log_s,
+        const float* __restrict__ quats,
+        const float* __restrict__ gain,
+        const float* __restrict__ inten,
+        float scale_min, float mahal_clamp,
+        int M, int N,
+        float* __restrict__ out)
+{
+    __shared__ float s_mu[TILE_FWD][3];
+    __shared__ float s_ls[TILE_FWD][3];
+    __shared__ float s_qu[TILE_FWD][4];
+    __shared__ float s_ga[TILE_FWD];
+    __shared__ float s_iv[TILE_FWD];
+
+    const int m      = blockIdx.x * BLOCK_FWD + threadIdx.x;
+    const bool active = (m < M);
+
+    float px=0.f, py=0.f, pz=0.f;
+    if (active) { px = pts[m*3+0]; py = pts[m*3+1]; pz = pts[m*3+2]; }
     float acc = 0.f;
 
-    for (int k = 0; k < N; ++k) {
-        float qn[4], R[9];
-        float inv_norm;
-        normalize_quat(quats + k*4, qn, inv_norm);
-        quat_to_rotmat(qn, R);
+    for (int t0 = 0; t0 < N; t0 += TILE_FWD) {
+        const int tn = min(TILE_FWD, N - t0);
 
-        const float s0 = fmaxf(expf(log_s[k*3+0]), scale_min);
-        const float s1 = fmaxf(expf(log_s[k*3+1]), scale_min);
-        const float s2 = fmaxf(expf(log_s[k*3+2]), scale_min);
+        /* cooperative load: each thread loads one Gaussian (if in range) */
+        for (int i = threadIdx.x; i < tn; i += BLOCK_FWD) {
+            const int k = t0 + i;
+            s_mu[i][0] = means[k*3+0]; s_mu[i][1] = means[k*3+1]; s_mu[i][2] = means[k*3+2];
+            s_ls[i][0] = log_s[k*3+0]; s_ls[i][1] = log_s[k*3+1]; s_ls[i][2] = log_s[k*3+2];
+            s_qu[i][0] = quats[k*4+0]; s_qu[i][1] = quats[k*4+1];
+            s_qu[i][2] = quats[k*4+2]; s_qu[i][3] = quats[k*4+3];
+            s_ga[i] = gain[k];
+            s_iv[i] = inten[k];
+        }
+        __syncthreads();
 
-        const float diff[3] = {px - means[k*3+0], py - means[k*3+1], pz - means[k*3+2]};
-        float u[3];
-        mat_t_vec(R, diff, u);  /* u = Rᵀ diff */
+        if (active) {
+            for (int i = 0; i < tn; i++) {
+                float qn[4], R[9], inv_norm;
+                normalize_quat(s_qu[i], qn, inv_norm);
+                quat_to_rotmat(qn, R);
 
-        const float mahal = u[0]*u[0]/(s0*s0) + u[1]*u[1]/(s1*s1) + u[2]*u[2]/(s2*s2);
-        if (mahal >= mahal_clamp) continue;
+                const float s0 = fmaxf(expf(s_ls[i][0]), scale_min);
+                const float s1 = fmaxf(expf(s_ls[i][1]), scale_min);
+                const float s2 = fmaxf(expf(s_ls[i][2]), scale_min);
 
-        acc += gain[k] * inten[k] * expf(-0.5f * mahal);
+                const float diff[3] = {px-s_mu[i][0], py-s_mu[i][1], pz-s_mu[i][2]};
+                float u[3];
+                mat_t_vec(R, diff, u);
+
+                const float mahal = u[0]*u[0]/(s0*s0) + u[1]*u[1]/(s1*s1) + u[2]*u[2]/(s2*s2);
+                if (mahal >= mahal_clamp) continue;
+
+                acc += s_ga[i] * s_iv[i] * expf(-0.5f * mahal);
+            }
+        }
+        __syncthreads();
     }
-    out[m] = acc;
+
+    if (active) out[m] = acc;
 }
 
 
-// ─── Backward kernel ──────────────────────────────────────────────────────────
+// ─── Backward kernel (transposed: one thread per Gaussian, no atomicAdd) ─────
 /*
- * One thread per sample point m ∈ [0, M).
- * For each m and each Gaussian k, accumulates:
+ * Transposed layout eliminates all atomicAdd contention.
  *
- *   grad_inten[k] += g_out[m] · gain[k] · w          (∂L/∂inten, post-softplus)
- *   grad_gain[k]  += g_out[m] · inten[k] · w
+ * Original layout:  M threads × N Gaussians → M×N×11 atomic writes.
+ * Transposed layout: N threads × M points  → each thread writes its own
+ *                    Gaussian gradient exactly once at the end.
  *
- *   let grad_factor = g_out[m] · gain[k] · inten[k] · w
- *   let tmp[i] = u[i] / s[i]²                         (Σ⁻¹ direction in local frame)
- *   let adiff  = R · tmp                               (Σ⁻¹ diff in world frame)
+ * Each thread k:
+ *   1. Loads its Gaussian parameters once (R, scales, gain, inten).
+ *   2. Loops over all M sample points accumulating gradient contributions
+ *      into local registers (gm, gls, gR, …).
+ *   3. Writes the accumulated gradients to global memory once — no atomics.
  *
- *   grad_means[k]  += grad_factor · adiff
- *   grad_log_s[k,i]+= grad_factor · u[i]² / s[i]²    (if not clamped)
- *   grad_R[i,j]    = -grad_factor · diff[i] · tmp[j]
- *   grad_quats[k]  += backprop(grad_R through quat_to_rotmat + normalise)
- *
- * atomicAdd is required because multiple threads (sample points) may
- * simultaneously update the same Gaussian's gradient.
+ * quat_grad_from_rot_grad is linear in grad_R, so accumulating grad_R across
+ * all M points and applying it once is mathematically identical to applying it
+ * per-point and summing (which the original kernel did via atomicAdd).
  */
 __global__ void gaussian_backward_kernel(
-        const float* __restrict__ grad_out,  /* (M,)   upstream gradient       */
-        const float* __restrict__ pts,       /* (M,3)                          */
-        const float* __restrict__ means,     /* (N,3)                          */
-        const float* __restrict__ log_s,     /* (N,3)                          */
-        const float* __restrict__ quats,     /* (N,4)                          */
-        const float* __restrict__ gain,      /* (N,)                           */
-        const float* __restrict__ inten,     /* (N,)   softplus value          */
-        float scale_min,
-        float mahal_clamp,
+        const float* __restrict__ grad_out,
+        const float* __restrict__ pts,
+        const float* __restrict__ means,
+        const float* __restrict__ log_s,
+        const float* __restrict__ quats,
+        const float* __restrict__ gain,
+        const float* __restrict__ inten,
+        float scale_min, float mahal_clamp,
         int M, int N,
-        float* __restrict__ grad_means,      /* (N,3)                          */
-        float* __restrict__ grad_log_s,      /* (N,3)                          */
-        float* __restrict__ grad_quats,      /* (N,4)                          */
-        float* __restrict__ grad_gain,       /* (N,)                           */
-        float* __restrict__ grad_inten       /* (N,)   w.r.t. softplus value   */
-) {
-    const int m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m >= M) return;
+        float* __restrict__ grad_means,
+        float* __restrict__ grad_log_s,
+        float* __restrict__ grad_quats,
+        float* __restrict__ grad_gain,
+        float* __restrict__ grad_inten)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= N) return;
 
-    const float g_out = grad_out[m];
-    if (g_out == 0.f) return;
+    /* ── Load this Gaussian's data once ──────────────────────────────────── */
+    float qn[4], R[9], inv_norm;
+    normalize_quat(quats + k*4, qn, inv_norm);
+    quat_to_rotmat(qn, R);
 
-    const float px = pts[m*3+0];
-    const float py = pts[m*3+1];
-    const float pz = pts[m*3+2];
+    const float rs0 = expf(log_s[k*3+0]);
+    const float rs1 = expf(log_s[k*3+1]);
+    const float rs2 = expf(log_s[k*3+2]);
+    const bool  cl0 = rs0 <= scale_min;
+    const bool  cl1 = rs1 <= scale_min;
+    const bool  cl2 = rs2 <= scale_min;
+    const float s0  = fmaxf(rs0, scale_min);
+    const float s1  = fmaxf(rs1, scale_min);
+    const float s2  = fmaxf(rs2, scale_min);
+    const float is2_0 = 1.f/(s0*s0);
+    const float is2_1 = 1.f/(s1*s1);
+    const float is2_2 = 1.f/(s2*s2);
+    const float g_k = gain[k];
+    const float v_k = inten[k];
+    const float mx  = means[k*3+0], my = means[k*3+1], mz = means[k*3+2];
 
-    for (int k = 0; k < N; ++k) {
-        float qn[4], R[9];
-        float inv_norm;
-        normalize_quat(quats + k*4, qn, inv_norm);
-        quat_to_rotmat(qn, R);
+    /* ── Local accumulators (registers, no atomics) ───────────────────────── */
+    float gm0=0.f, gm1=0.f, gm2=0.f;
+    float gls0=0.f, gls1=0.f, gls2=0.f;
+    float gR[9] = {0.f,0.f,0.f, 0.f,0.f,0.f, 0.f,0.f,0.f};
+    float g_gain_acc=0.f, g_inten_acc=0.f;
 
-        const float rs0 = expf(log_s[k*3+0]);
-        const float rs1 = expf(log_s[k*3+1]);
-        const float rs2 = expf(log_s[k*3+2]);
-        /* Track whether each axis was clamped (no gradient through clamp). */
-        const bool cl0 = rs0 <= scale_min;
-        const bool cl1 = rs1 <= scale_min;
-        const bool cl2 = rs2 <= scale_min;
-        const float s0 = fmaxf(rs0, scale_min);
-        const float s1 = fmaxf(rs1, scale_min);
-        const float s2 = fmaxf(rs2, scale_min);
-        const float is2_0 = 1.f/(s0*s0);
-        const float is2_1 = 1.f/(s1*s1);
-        const float is2_2 = 1.f/(s2*s2);
+    /* ── Loop over all M sample points ───────────────────────────────────── */
+    for (int m = 0; m < M; ++m) {
+        const float g_out = grad_out[m];
+        if (g_out == 0.f) continue;
 
-        const float diff[3] = {px - means[k*3+0], py - means[k*3+1], pz - means[k*3+2]};
+        const float diff[3] = {pts[m*3+0]-mx, pts[m*3+1]-my, pts[m*3+2]-mz};
         float u[3];
-        mat_t_vec(R, diff, u);  /* u = Rᵀ diff */
+        mat_t_vec(R, diff, u);
 
         const float mahal = u[0]*u[0]*is2_0 + u[1]*u[1]*is2_1 + u[2]*u[2]*is2_2;
         if (mahal >= mahal_clamp) continue;
 
-        const float g    = gain[k];
-        const float v    = inten[k];
-        const float w    = expf(-0.5f * mahal);
+        const float w           = expf(-0.5f * mahal);
+        const float grad_factor = g_out * g_k * v_k * w;
 
-        /* Chain: ∂L/∂w = g_out · g · v,  ∂w/∂mahal = -0.5·w,
-         * ∂mahal/∂diff = 2·Σ⁻¹·diff  →  grad_factor absorbs -0.5·(-2) = 1. */
-        const float grad_factor = g_out * g * v * w;
+        g_gain_acc  += g_out * v_k * w;
+        g_inten_acc += g_out * g_k * w;
 
-        /* ── ∂L/∂inten and ∂L/∂gain ───────────────────────────────────────── */
-        atomicAdd(&grad_inten[k], g_out * g * w);   /* w.r.t. post-softplus v */
-        atomicAdd(&grad_gain[k],  g_out * v * w);
-
-        /* ── ∂L/∂means ────────────────────────────────────────────────────── */
         const float tmp[3] = {u[0]*is2_0, u[1]*is2_1, u[2]*is2_2};
         float adiff[3];
-        mat_vec(R, tmp, adiff);  /* adiff = R tmp = Σ⁻¹ diff (world frame) */
+        mat_vec(R, tmp, adiff);
 
-        atomicAdd(&grad_means[k*3+0], grad_factor * adiff[0]);
-        atomicAdd(&grad_means[k*3+1], grad_factor * adiff[1]);
-        atomicAdd(&grad_means[k*3+2], grad_factor * adiff[2]);
+        gm0 += grad_factor * adiff[0];
+        gm1 += grad_factor * adiff[1];
+        gm2 += grad_factor * adiff[2];
 
-        /* ── ∂L/∂log_s ────────────────────────────────────────────────────── */
-        if (!cl0) atomicAdd(&grad_log_s[k*3+0], grad_factor * u[0]*u[0]*is2_0);
-        if (!cl1) atomicAdd(&grad_log_s[k*3+1], grad_factor * u[1]*u[1]*is2_1);
-        if (!cl2) atomicAdd(&grad_log_s[k*3+2], grad_factor * u[2]*u[2]*is2_2);
+        if (!cl0) gls0 += grad_factor * u[0]*u[0]*is2_0;
+        if (!cl1) gls1 += grad_factor * u[1]*u[1]*is2_1;
+        if (!cl2) gls2 += grad_factor * u[2]*u[2]*is2_2;
 
-        /* ── ∂L/∂quats (via ∂L/∂R) ─────────────────────────────────────────
-         * grad_R[i,j] = ∂L/∂R[i,j] = -grad_factor · diff[i] · tmp[j]      */
-        float grad_R[9];
+        /* accumulate ∂L/∂R across all points; apply quat backprop once below */
         for (int i = 0; i < 3; ++i)
             for (int j = 0; j < 3; ++j)
-                grad_R[i*3+j] = -grad_factor * diff[i] * tmp[j];
-
-        float grad_qraw[4];
-        quat_grad_from_rot_grad(grad_R, qn, inv_norm, grad_qraw);
-
-        atomicAdd(&grad_quats[k*4+0], grad_qraw[0]);
-        atomicAdd(&grad_quats[k*4+1], grad_qraw[1]);
-        atomicAdd(&grad_quats[k*4+2], grad_qraw[2]);
-        atomicAdd(&grad_quats[k*4+3], grad_qraw[3]);
+                gR[i*3+j] -= grad_factor * diff[i] * tmp[j];
     }
+
+    /* ── Write results once — no atomics ─────────────────────────────────── */
+    grad_means[k*3+0] = gm0;
+    grad_means[k*3+1] = gm1;
+    grad_means[k*3+2] = gm2;
+    grad_log_s[k*3+0] = gls0;
+    grad_log_s[k*3+1] = gls1;
+    grad_log_s[k*3+2] = gls2;
+    grad_gain[k]  = g_gain_acc;
+    grad_inten[k] = g_inten_acc;
+
+    float grad_qraw[4];
+    quat_grad_from_rot_grad(gR, qn, inv_norm, grad_qraw);
+    grad_quats[k*4+0] = grad_qraw[0];
+    grad_quats[k*4+1] = grad_qraw[1];
+    grad_quats[k*4+2] = grad_qraw[2];
+    grad_quats[k*4+3] = grad_qraw[3];
 }
 
 
@@ -323,11 +351,10 @@ torch::Tensor gaussian_forward(
     const int N = static_cast<int>(means.size(0));
     auto out = torch::zeros({M}, pts.options());
 
-    const int threads = 256;
-    const int blocks  = (M + threads - 1) / threads;
+    const int blocks = (M + BLOCK_FWD - 1) / BLOCK_FWD;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    gaussian_forward_kernel<<<blocks, threads, 0, stream>>>(
+    gaussian_forward_kernel<<<blocks, BLOCK_FWD, 0, stream>>>(
         pts.data_ptr<float>(),
         means.data_ptr<float>(),
         log_s.data_ptr<float>(),
@@ -369,8 +396,9 @@ py::tuple gaussian_backward(
     auto grad_gain  = torch::zeros_like(gain);
     auto grad_inten = torch::zeros_like(inten);
 
+    /* Transposed kernel: one thread per Gaussian (N), not per point (M). */
     const int threads = 256;
-    const int blocks  = (M + threads - 1) / threads;
+    const int blocks  = (N + threads - 1) / threads;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     gaussian_backward_kernel<<<blocks, threads, 0, stream>>>(

@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# run14 — edge-aware training
+#
+# Changes vs run13:
+#   + lambda_grad = 0.05       : gradient sharpness loss on Z-slice crops
+#                                forces sharp soma/dendrite boundaries
+#   + grad_sample_weight = 0.4 : 40 % of sampling mass toward high-gradient
+#                                voxels (edges); 60 % toward bright intensity
+#   + interior_init_n = 5000   : 5 k extra Gaussians seeded inside soma
+#                                (gt > 0.3) to fill the interior black-hole
+#   + interior_init_thresh=0.3 : bright-interior threshold for the above
+#   + ssim_start_step = 20000  : same as run13 (SSIM active during densif.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── I/O ───────────────────────────────────────────────────────────────────────
+volume:   data/10-2900-control-cell-05.oif-C0.v3dpbd.tif
+swc_path: data/10-2900-control-cell-05.oif-C0.v3dpbd.swc
+out:      logs/3dgs/run14
+device:   cuda
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+n_init:          20000
+max_gaussians:   150000
+init_scale:      0.05
+init_inten:      0.1
+
+# ── Training schedule ─────────────────────────────────────────────────────────
+epochs:          2000
+steps_per_epoch: 50
+batch:           4096
+chunk_n:         1024
+
+# ── Sampling ──────────────────────────────────────────────────────────────────
+swc_init:            true
+grad_sample_weight:  0.4    # 40% edge-voxel bias in importance sampling CDF
+
+# ── Interior initialisation (soma fill) ───────────────────────────────────────
+interior_init_n:      5000  # extra Gaussians seeded inside bright soma interior
+interior_init_thresh: 0.30  # voxels with gt > 0.30 are eligible
+
+# ── Numerical stability ────────────────────────────────────────────────────────
+scale_min_clamp: 1.0e-5
+mahal_max_clamp: 20.0
+grad_clip_norm:  1.0
+
+# ── Learning rates ─────────────────────────────────────────────────────────────
+lr_means:          1.6e-4
+lr_means_final:    1.6e-6
+lr_scales:         5.0e-3
+lr_quats:          1.0e-3
+lr_inten:          1.0e-2
+lr_final_fraction: 0.01
+adam_eps:          1.0e-15
+
+# ── Regularisation ─────────────────────────────────────────────────────────────
+lambda_scale:         5.0e-5
+lambda_sparsity:      5.0e-3
+lambda_scale_ceiling: 1.0e-3
+lambda_scale_outlier: 5.0e-4
+scale_max_hard:       0.50
+scale_min_hard:       0.008
+lambda_aniso:         4.0e-4
+lambda_count:         5.0e-4
+lambda_L1:            3.0e-4
+lambda_coverage:      1.0e-4
+prune_inten_thresh:   8.0e-3
+
+# ── Edge sharpness loss ────────────────────────────────────────────────────────
+lambda_grad:          0.05   # gradient L1 on Z-slice crops; sharpens soma edges
+
+# ── GaussianPile additions ─────────────────────────────────────────────────────
+lambda_ssim:          0.2
+ssim_crop:            64
+ssim_start_step:      20000
+init_scale_z_factor:  1.0
+
+# ── Adaptive density control ───────────────────────────────────────────────────
+densify_from_step:      500
+densify_until_step:     50000
+densify_interval:       200
+densify_grad_thresh:    2.0e-4
+densify_max_scale:      0.03
+split_scale_divisor:    1.6
+log_scale_floor:        -6.0
+
+# ── Evaluation / logging ───────────────────────────────────────────────────────
+eval_samples:         200000
+eval_detail_interval: 5
+log_interval:         10
+ckpt_interval:        2000

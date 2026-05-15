@@ -38,38 +38,65 @@ from torch.utils.cpp_extension import load
 from _3dgs._3dgs_training import train_impl as _train_impl
 
 
-# ── CUDA kernel singleton ─────────────────────────────────────────────────────
+# ── CUDA kernel singletons ────────────────────────────────────────────────────
 # USE_CUDA_KERNEL is toggled by --use_kernel at startup.  Keeping it as a
 # module-level flag avoids threading a boolean through every call site while
 # still allowing a clean CPU fallback path.
 USE_CUDA_KERNEL = False
-_3dgs_cuda = None
+_3dgs_cuda      = None
+_eval_cuda      = None   # 3dgs_eval_cuda: reconstruct_volume + splat_mip
+
+
+def _find_cuda_include() -> list:
+    """Return an include path that has the full CUDA toolkit headers (cuda_runtime.h + nv/target)."""
+    import os
+    candidates = []
+    cuda_home = os.environ.get('CUDA_HOME', '')
+    if cuda_home:
+        candidates.append(Path(cuda_home) / 'include')
+    try:
+        import sys as _sys
+        conda_root = Path(_sys.executable).parent.parent
+        for inc in sorted((conda_root / 'envs').glob('*/include')):
+            candidates.append(inc)
+        candidates.insert(0, Path(_sys.prefix) / 'include')
+    except Exception:
+        pass
+    for p in candidates:
+        if (p / 'nv' / 'target').exists() and (p / 'cuda_runtime.h').exists():
+            return [str(p)]
+    return []
+
+
+def _load_eval_kernel():
+    """Lazily compile and cache 3dgs_eval_cuda (reconstruct_volume + splat_mip)."""
+    global _eval_cuda
+    if _eval_cuda is None:
+        src = Path(__file__).parent / "3dgs_eval_cuda.cu"
+        extra_inc = _find_cuda_include()
+        extra_flags = ["-O3", "--use_fast_math"] + [f"-I{p}" for p in extra_inc]
+        _eval_cuda = load(
+            name="3dgs_eval_cuda",
+            sources=[str(src)],
+            extra_cuda_cflags=extra_flags,
+            extra_include_paths=extra_inc,
+            verbose=False,
+        )
+    return _eval_cuda
 
 
 def _load_3dgs_kernel():
-    """Lazily compile and cache the fused CUDA Gaussian-field extension.
-
-    Why lazy?  torch.utils.cpp_extension.load triggers JIT compilation the
-    first time it is called, which takes several seconds.  Deferring to the
-    first forward pass avoids that cost during --help or a CPU dry-run.
-    The singleton pattern ensures compilation runs at most once per process.
-    """
+    """Lazily compile and cache the fused CUDA Gaussian-field extension."""
     global _3dgs_cuda
     if _3dgs_cuda is None:
-        import sys, os
-        src = Path(__file__).parent / "3dgs_cuda.cu"
-        # Collect candidate CUDA include dirs (covers pip-installed nvidia packages)
-        cuda_inc_candidates = [
-            Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
-            / "site-packages" / "nvidia" / "cuda_runtime" / "include",
-            Path(sys.prefix) / "include",
-        ]
-        extra_inc = [str(p) for p in cuda_inc_candidates if (p / "cuda_runtime.h").exists()]
+        src        = Path(__file__).parent / "3dgs_cuda.cu"
+        extra_inc  = _find_cuda_include()
         extra_flags = ["-O3", "--use_fast_math"] + [f"-I{p}" for p in extra_inc]
         _3dgs_cuda = load(
             name="gaussian_3dgs_cuda",
             sources=[str(src)],
             extra_cuda_cflags=extra_flags,
+            extra_include_paths=extra_inc,
             verbose=False,
         )
     return _3dgs_cuda
@@ -249,6 +276,34 @@ def load_swc(path: str) -> np.ndarray:
                 float(parts[4]),        # z
                 float(parts[5]),        # radius
                 int(float(parts[6])),   # parent id
+            ])
+    if not rows:
+        raise ValueError(f'No SWC points found in {path}')
+    return np.asarray(rows, dtype=np.float32)
+
+
+def load_swc_full(path: str) -> np.ndarray:
+    """Parse an SWC file and return (N, 6) float32: [node_id, x, y, z, radius, parent_id].
+
+    Unlike load_swc, the node ID is preserved as column 0 so that parent-child
+    direction vectors can be computed for oriented Gaussian initialisation.
+    """
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            rows.append([
+                int(float(parts[0])),   # node id
+                float(parts[2]),        # x (voxel index)
+                float(parts[3]),        # y
+                float(parts[4]),        # z
+                float(parts[5]),        # radius
+                int(float(parts[6])),   # parent id (-1 = root)
             ])
     if not rows:
         raise ValueError(f'No SWC points found in {path}')
@@ -445,7 +500,8 @@ class GaussianCloud:
     """
 
     def __init__(self, n_init: int, aabb: AABB, device, cfg: argparse.Namespace,
-                 init_pts: torch.Tensor | None = None):
+                 init_pts: torch.Tensor | None = None,
+                 init_quats: torch.Tensor | None = None):
         self.aabb        = aabb
         self.device      = device
         self.scale_min   = cfg.scale_min_clamp
@@ -454,26 +510,42 @@ class GaussianCloud:
         lo = aabb.lo.to(device)
         ex = aabb.extent.to(device)
 
-        # ── Initialise means ─────────────────────────────────────────────────
+        # ── Initialise means (and optional oriented quats) ────────────────────
         # SWC skeleton coordinates give a warm start near the neuron structure.
-        # Without them, Gaussians start uniformly random and must migrate first.
+        # init_quats (if provided) carries branch-direction quaternions that are
+        # selected with the same permutation as the means.
         if init_pts is not None and init_pts.numel() > 0:
             init_pts = init_pts.to(device)
-            if init_pts.shape[0] >= n_init:
-                perm  = torch.randperm(init_pts.shape[0], device=device)[:n_init]
-                means = init_pts[perm]
+            M = init_pts.shape[0]
+            if M >= n_init:
+                sel = torch.randperm(M, device=device)[:n_init]
             else:
-                # Repeat-sample skeleton points to reach n_init
-                repeat_idx = torch.randint(0, init_pts.shape[0],
-                                           (n_init - init_pts.shape[0],), device=device)
-                means = torch.cat([init_pts, init_pts[repeat_idx]], dim=0)
+                extra = torch.randint(0, M, (n_init - M,), device=device)
+                sel   = torch.cat([torch.arange(M, device=device), extra])
+            means = init_pts[sel]
+
+            if init_quats is not None and init_quats.numel() > 0:
+                iq = init_quats.to(device)
+                quats = iq[sel % iq.shape[0]]
+            else:
+                quats = torch.zeros(n_init, 4, device=device)
+                quats[:, 0] = 1.0
         else:
             means = lo + torch.rand(n_init, 3, device=device) * ex
+            quats = torch.zeros(n_init, 4, device=device)
+            quats[:, 0] = 1.0
 
-        # ── Initialise shape: isotropic, identity rotation ───────────────────
+        # ── Initialise shape: PSF-aware anisotropic scales ────────────────────
+        # In the unit AABB all axes span [-1,1], but the voxel spacing differs:
+        #   z step = 2/(D-1),   x/y step = 2/(W-1)
+        # A physically-isotropic Gaussian must have s_z/s_xy = (W-1)/(D-1).
+        # init_scale_z_factor encodes this ratio (default 1.0 = isotropic).
+        # Setting it to ~(W-1)/(D-1) gives Gaussians that are spherical in
+        # physical voxel space at initialisation, matching the confocal PSF.
         log_s = torch.full((n_init, 3), math.log(cfg.init_scale), device=device)
-        quats = torch.zeros(n_init, 4, device=device)
-        quats[:, 0] = 1.0       # w=1 → identity rotation in SO(3)
+        z_factor = max(float(getattr(cfg, 'init_scale_z_factor', 1.0)), 1e-3)
+        if z_factor != 1.0:
+            log_s[:, 2] = log_s[:, 2] + math.log(z_factor)
 
         # ── Initialise intensity via softplus inverse ─────────────────────────
         # We optimise raw_inten where v = softplus(raw_inten).
@@ -550,9 +622,11 @@ class GaussianCloud:
             diff = pts.unsqueeze(1) - self.means[s:e].unsqueeze(0)
             # xS:  (M, chunk, 3) — diff pre-multiplied by Σ⁻¹
             xS   = (diff.unsqueeze(-2) @ si.unsqueeze(0)).squeeze(-2)
-            # mah: (M, chunk)    — Mahalanobis² clamped to prevent exp underflow
-            mah  = (xS * diff).sum(-1).clamp(max=self.mahal_clamp)
-            w    = torch.exp(-0.5 * mah)       # Gaussian kernel weights
+            # mah: (M, chunk) — Mahalanobis²; skip distant Gaussians (matches CUDA kernel)
+            mah  = (xS * diff).sum(-1)
+            w    = torch.where(mah < self.mahal_clamp,
+                               torch.exp(-0.5 * mah.clamp(max=self.mahal_clamp)),
+                               torch.zeros_like(mah))
             out  = out + (v * w).sum(-1)        # accumulate over chunk
 
         return out
@@ -649,7 +723,10 @@ class GaussianCloud:
 
             high_g = avg_g  > grad_thresh
             small  = curr_s < max_scale
-            dead   = ~in_box
+            # A Gaussian is dead if it left the volume OR its intensity is
+            # negligible (pruned by lambda_count driving softplus(inten) → 0).
+            dim    = F.softplus(self.inten) < cfg.prune_inten_thresh
+            dead   = ~in_box | dim
 
             keep     = ~dead
             n_pruned = self.N - keep.sum().item()
@@ -729,20 +806,26 @@ class GaussianCloud:
             return float('nan'), float('nan')
         return s.mean().item(), s.max().item()
 
-    def clamp_scales(self, scale_max_hard: float | None = None):
-        """Hard-clamp log_scales to keep Gaussians from growing unbounded.
+    def clamp_scales(self, scale_max_hard: float | None = None,
+                     scale_min_hard: float | None = None):
+        """Hard-clamp log_scales to keep Gaussians within a valid range.
 
         Why clamp in log space?  The optimizer works on log_s, so clamping
         log_s directly avoids a round-trip through exp/log and the associated
         floating-point error.  The ceiling is applied every gradient step so
         the soft scale_ceiling_reg loss term has a gradient even when the hard
         clamp is active.
+
+        scale_min_hard: meaningful lower bound (e.g. 0.003) that prevents the
+        aniso penalty from collapsing s_min to a needle.  Falls back to the
+        numerical-stability floor (scale_min_clamp) when not set.
         """
         with torch.no_grad():
             if scale_max_hard is not None and scale_max_hard > 0:
                 self.log_s.data.clamp_(max=math.log(scale_max_hard))
-            # Always enforce the minimum to prevent singular covariance
-            self.log_s.data.clamp_(min=math.log(self.scale_min))
+            # Prefer the meaningful floor; always at least the stability floor
+            min_floor = max(scale_min_hard or 0.0, self.scale_min)
+            self.log_s.data.clamp_(min=math.log(min_floor))
 
     # ── persistence ────────────────────────────────────────────────────────────
     def save(self, path):
@@ -904,35 +987,150 @@ def update_lr(optimizer: torch.optim.Adam, step: int,
 # ─────────────────────────────────────────────────────────────────────────────
 # Loss functions
 # ─────────────────────────────────────────────────────────────────────────────
-# Why multiple regularisation terms beyond plain MSE?
-#   MSE alone produces a few very large, diffuse Gaussians that average out
-#   the signal rather than resolving fine structure.  The terms below push
-#   toward many compact Gaussians concentrated on bright voxels.
+# Objective: reconstruct the neuron volume with the fewest ellipsoids at the
+# highest fidelity.  The full loss is:
+#
+#   L = L1(pred, gt) + λ_ssim · SSIM_slice(pred, gt)    [reconstruction — GaussianPile]
+#     + λ_scale    · (1/N) Σ_k  s_max,k²               [bloat penalty]
+#     + λ_ceiling  · (1/N) Σ_k  relu(s_max,k − cap)    [hard ceiling]
+#     + λ_outlier  · (1/N) Σ_k  relu(s_max,k − τ)      [outlier suppression]
+#     + λ_sparsity · (1/N) Σ_k  v_k · (1 − GT(μ_k))   [background → zero]
+#     + λ_aniso    · (1/N) Σ_k  s_min,k²               [thin axes → elongated]
+#     + λ_count    · (1/N) Σ_k  σ(raw_inten_k)         [soft-L0 count penalty]
+#     + λ_L1       · (1/N) Σ_k  v_k                    [L1 intensity → kill zombies]
+#     + λ_coverage · (1/N) Σ_k  −log(s_max,k / s_ref)  [coverage reward → bigger ellipsoids]
+#
+# where s_max,k / s_min,k are the longest / shortest axes of ellipsoid k,
+# v_k = softplus(raw_inten_k), σ = sigmoid, τ = median + 3·MAD,
+# s_ref = init_scale (the initialisation scale, typically 0.05).
+#
+# λ_L1 and λ_coverage are the two terms that address run6's failure modes:
+#
+#   λ_L1 adds a steady pull on every Gaussian toward v_k = 0.  The sigmoid
+#        count gradient σ(1−σ) → 0 for already-dead Gaussians, leaving a
+#        zombie population with v ≈ 0.005–0.01.  L1's gradient is constant
+#        (= sigmoid(raw)), so it finishes the job: those zombies collapse.
+#
+#   λ_coverage rewards each surviving Gaussian for having a large s_max.
+#        −log(s_max/s_ref) < 0 when s_max > s_ref, directly reducing the
+#        loss.  Together with λ_aniso (collapse s_min), this drives a
+#        sphere → cigar transition: one long ellipsoid covers an entire
+#        neurite segment instead of several small spheres.
 #
 # Why a dispatch table (_LOSS_TERM_SPECS)?
-#   It separates the definition of each term (name, weight config key, function)
-#   from the summation loop, making it trivial to add or remove a term without
-#   touching the loop logic.  Each term function receives a _LossContext
-#   so it has access to every quantity it might need without extra parameters.
+#   It separates term definition from the summation loop, making it trivial
+#   to add or remove a term without touching the loop logic.
 #%%
 class _LossContext(NamedTuple):
     """Frozen bundle of all quantities needed by loss term functions.
 
     Computed once per step by _make_loss_context() and shared across all
-    term functions to avoid redundant computation (e.g. s_max is expensive
-    and needed by three different term functions).
+    term functions to avoid redundant computation.
     """
     pred:    torch.Tensor       # (M,) model prediction
     gt:      torch.Tensor       # (M,) ground-truth intensities
     gc:      "GaussianCloud"
     cfg:     argparse.Namespace
     dataset: "VolumeDataset"
-    s_max:   torch.Tensor       # (N,) per-Gaussian max axis scale, pre-computed
+    s_max:   torch.Tensor       # (N,) per-Gaussian max axis scale
+    s_min:   torch.Tensor       # (N,) per-Gaussian min axis scale
+    step:    int = 0            # current global optimizer step (for conditional losses)
+
+
+def _ssim_2d(pred: torch.Tensor, gt: torch.Tensor, window: int = 11) -> torch.Tensor:
+    """SSIM loss on (1, 1, H, W) float32 tensors. Returns 1 − SSIM ∈ [0, 2].
+
+    Uses a separable Gaussian window (σ=1.5) to estimate local statistics.
+    The 1− convention makes it a loss (0 = perfect match).
+    """
+    sigma  = 1.5
+    coords = torch.arange(window, dtype=pred.dtype, device=pred.device) - window // 2
+    gk     = torch.exp(-coords.pow(2) / (2.0 * sigma ** 2))
+    gk     = gk / gk.sum()
+    filt   = (gk.unsqueeze(0) * gk.unsqueeze(1)).reshape(1, 1, window, window)
+
+    pad    = window // 2
+    mu1    = F.conv2d(pred,      filt, padding=pad)
+    mu2    = F.conv2d(gt,        filt, padding=pad)
+    sig1   = F.conv2d(pred*pred, filt, padding=pad) - mu1 * mu1
+    sig2   = F.conv2d(gt*gt,     filt, padding=pad) - mu2 * mu2
+    sig12  = F.conv2d(pred*gt,   filt, padding=pad) - mu1 * mu2
+
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    ssim_map = ((2.0*mu1*mu2 + c1) * (2.0*sig12 + c2)) / \
+               ((mu1*mu1 + mu2*mu2 + c1) * (sig1 + sig2 + c2))
+    return 1.0 - ssim_map.mean()
+
+
+def _ssim_slice_loss(gc: "GaussianCloud", dataset: "VolumeDataset",
+                     cfg: argparse.Namespace) -> torch.Tensor:
+    """Render a random Z-slice crop and return the SSIM loss against GT.
+
+    Crop size is cfg.ssim_crop (default 64).  At 64×64 = 4 096 query points
+    this adds roughly 2× the per-step forward cost — acceptable overhead.
+    The rendered crop is differentiable w.r.t. all Gaussian parameters.
+    """
+    device = gc.device
+    D, H, W = dataset.D, dataset.H, dataset.W
+    crop    = int(getattr(cfg, 'ssim_crop', 64))
+    crop    = min(crop, H, W)
+
+    z  = int(torch.randint(0, D,         (1,)).item())
+    r0 = int(torch.randint(0, H - crop + 1, (1,)).item())
+    c0 = int(torch.randint(0, W - crop + 1, (1,)).item())
+
+    lo, hi = gc.aabb.lo, gc.aabb.hi
+    ih_idx = torch.arange(r0, r0 + crop)
+    iw_idx = torch.arange(c0, c0 + crop)
+    ih_g, iw_g = torch.meshgrid(ih_idx, iw_idx, indexing='ij')   # (crop, crop)
+
+    zn = float(lo[2] + (z / max(D - 1, 1)) * (hi[2] - lo[2]))
+    yn = lo[1] + (ih_g.float() / max(H - 1, 1)) * (hi[1] - lo[1])
+    xn = lo[0] + (iw_g.float() / max(W - 1, 1)) * (hi[0] - lo[0])
+    pts = torch.stack([xn.reshape(-1), yn.reshape(-1),
+                       torch.full((crop * crop,), zn)], dim=-1).to(device)
+
+    pred_flat = gc.forward(pts, chunk_n=cfg.chunk_n).clamp(0.0, 1.0)
+    gt_flat   = dataset.vol[z, r0:r0+crop, c0:c0+crop].reshape(-1).to(device)
+
+    pred_2d = pred_flat.reshape(1, 1, crop, crop)
+    gt_2d   = gt_flat.reshape(1, 1, crop, crop)
+    return _ssim_2d(pred_2d, gt_2d)
 
 
 def _loss_term_mse(ctx: _LossContext) -> torch.Tensor:
-    """Primary reconstruction fidelity: mean squared error."""
-    return F.mse_loss(ctx.pred, ctx.gt)
+    """Reconstruction loss: foreground-weighted L1 + λ_ssim · SSIM slice loss.
+
+    SSIM is gated by cfg.ssim_start_step (default 0 = always active).  Set
+    ssim_start_step = densify_until_step to prevent SSIM positional gradients
+    from inflating _grad_acc during the densification phase.
+
+    L1 vs MSE (GaussianPile):
+      L1 penalises residuals linearly — fairer to thin bright neurites where
+      a single voxel of error matters as much as a large background region.
+      MSE's quadratic scaling over-weights a few large errors and under-weights
+      the many small structural errors along neurite edges.
+
+    SSIM slice term:
+      Rendered on a random 64×64 Z-crop each step.  Captures local contrast
+      and structural continuity that pixel-wise L1 misses — specifically
+      discontinuities where a neurite branch disappears.
+      Weight: cfg.lambda_ssim (default 0.2, matching GaussianPile).
+    """
+    if getattr(ctx.cfg, 'log_intensity_loss', False):
+        # log1p-domain L1: compresses bright soma, amplifies dim dendrite signal.
+        # ∂(log1p(x))/∂x = 1/(1+x) → gradient at soma (x≈1) is half that at
+        # dendrites (x≈0.2), naturally rebalancing attention.
+        pred_l = torch.log1p(ctx.pred.clamp(0, 1))
+        gt_l   = torch.log1p(ctx.gt.clamp(0, 1))
+        l1 = F.l1_loss(pred_l, gt_l)
+    else:
+        l1 = F.l1_loss(ctx.pred, ctx.gt)
+    ssim_start = int(getattr(ctx.cfg, 'ssim_start_step', 0))
+    if ctx.step >= ssim_start:
+        lssim = _ssim_slice_loss(ctx.gc, ctx.dataset, ctx.cfg)
+        l1 = l1 + getattr(ctx.cfg, 'lambda_ssim', 0.2) * lssim
+    return l1
 
 
 def _loss_term_scale_reg(ctx: _LossContext) -> torch.Tensor:
@@ -984,6 +1182,103 @@ def _loss_term_sparsity(ctx: _LossContext) -> torch.Tensor:
     return loss_sparsity_intensity(ctx.gc, ctx.dataset, ctx.cfg)
 
 
+def _loss_term_anisotropy(ctx: _LossContext) -> torch.Tensor:
+    """Anisotropy penalty: L2 on the shortest axis of each ellipsoid.
+
+    Penalising s_min² while leaving s_max free collapses the short axes
+    toward zero, turning spheres into cigars aligned with the neurite.
+    One elongated ellipsoid can then cover an entire branch segment,
+    reducing the total count needed for a given fidelity.
+    Weight: cfg.lambda_aniso.
+    """
+    return ctx.s_min.pow(2).mean()
+
+
+def _loss_term_count(ctx: _LossContext) -> torch.Tensor:
+    """Soft-L0 count penalty: mean sigmoid of raw intensity parameters.
+
+    sigmoid(raw_inten) ≈ 1 for active Gaussians, ≈ 0 for dead ones.
+    The mean is therefore a differentiable proxy for the active fraction.
+    Gradient ∂σ/∂raw = σ(1−σ) peaks in the transition zone, gently
+    pulling borderline Gaussians toward extinction rather than hard-pruning.
+    Weight: cfg.lambda_count.
+    """
+    return torch.sigmoid(ctx.gc.inten).mean()
+
+
+def _loss_term_L1_intensity(ctx: _LossContext) -> torch.Tensor:
+    """L1 penalty on per-Gaussian intensity: mean(softplus(raw_inten)).
+
+    Unlike the sigmoid count term whose gradient σ(1−σ) → 0 for very
+    negative raw_inten (already-dead Gaussians), the L1 gradient is a
+    constant sigmoid(raw_inten) that never fully vanishes.  This gives a
+    steady pull toward v_k = 0 for every Gaussian, finishing off the
+    zombie population that the count term leaves behind.
+    Weight: cfg.lambda_L1.
+    """
+    return F.softplus(ctx.gc.inten).mean()
+
+
+def _loss_term_coverage(ctx: _LossContext) -> torch.Tensor:
+    """Coverage reward: penalise Gaussians smaller than s_ref.
+
+    −log(s_max / s_ref) is negative when s_max > s_ref, reducing total
+    loss and rewarding each surviving Gaussian for stretching to cover
+    more of a neurite segment.  Combined with the anisotropy term this
+    drives Gaussians toward long cigars rather than many small spheres.
+    s_ref is fixed at cfg.init_scale (the initialisation scale).
+    Weight: cfg.lambda_coverage.
+    """
+    # Clamp at scale_max_hard so reward saturates before the hard cap —
+    # prevents the term from dominating MSE as Gaussians press against the ceiling.
+    s_ref   = max(float(getattr(ctx.cfg, 'init_scale', 0.05)), 1e-4)
+    cap     = float(ctx.cfg.scale_max_hard) if getattr(ctx.cfg, 'scale_max_hard', None) else 1.0
+    s_ratio = (ctx.s_max / s_ref).clamp(min=1e-4, max=cap / s_ref)
+    return -torch.log(s_ratio).mean()
+
+
+def _loss_term_gradient(ctx: _LossContext) -> torch.Tensor:
+    """Gradient sharpness loss on a random Z-slice crop.
+
+    Computes central-difference gradients (dx, dy) of both the predicted and
+    GT slices, then returns their L1 difference.  This directly penalises
+    blurry soma/dendrite edges where the intensity transition should be sharp.
+    Weight: cfg.lambda_grad.
+    """
+    import random as _random
+    gc      = ctx.gc
+    dataset = ctx.dataset
+    cfg     = ctx.cfg
+    D, H, W = dataset.D, dataset.H, dataset.W
+    device  = gc.device
+    crop    = min(int(getattr(cfg, 'ssim_crop', 64)), H, W)
+
+    z  = _random.randint(0, D - 1)
+    r0 = _random.randint(0, max(0, H - crop))
+    c0 = _random.randint(0, max(0, W - crop))
+
+    lo, hi = gc.aabb.lo, gc.aabb.hi
+    ih_idx = torch.arange(r0, r0 + crop, device=device)
+    iw_idx = torch.arange(c0, c0 + crop, device=device)
+    ih_g, iw_g = torch.meshgrid(ih_idx, iw_idx, indexing='ij')
+    zn  = float(lo[2] + (z / max(D - 1, 1)) * (hi[2] - lo[2]))
+    yn  = lo[1] + (ih_g.float() / max(H - 1, 1)) * (hi[1] - lo[1])
+    xn  = lo[0] + (iw_g.float() / max(W - 1, 1)) * (hi[0] - lo[0])
+    pts = torch.stack([xn.reshape(-1), yn.reshape(-1),
+                       torch.full((crop * crop,), zn, device=device)], dim=-1)
+
+    pred = gc.forward(pts, chunk_n=cfg.chunk_n).clamp(0, 1).reshape(crop, crop)
+    gt   = dataset.vol[z, r0:r0 + crop, c0:c0 + crop].to(device)
+
+    # Central difference on interior pixels only (avoids boundary artefacts)
+    pred_dx = pred[:, 2:] - pred[:, :-2]
+    gt_dx   = gt[:, 2:]   - gt[:, :-2]
+    pred_dy = pred[2:, :] - pred[:-2, :]
+    gt_dy   = gt[2:, :]   - gt[:-2, :]
+
+    return F.l1_loss(pred_dx, gt_dx) + F.l1_loss(pred_dy, gt_dy)
+
+
 # Dispatch table: (name, weight_cfg_attr, term_fn)
 # weight_cfg_attr=None means the term is added unweighted (MSE).
 _LOSS_TERM_SPECS = (
@@ -992,22 +1287,30 @@ _LOSS_TERM_SPECS = (
     ("scale_ceiling_reg", "lambda_scale_ceiling",   _loss_term_scale_ceiling),
     ("scale_outlier_reg", "lambda_scale_outlier",   _loss_term_scale_outlier),
     ("sparsity",          "lambda_sparsity",        _loss_term_sparsity),
+    ("anisotropy",        "lambda_aniso",           _loss_term_anisotropy),
+    ("count",             "lambda_count",           _loss_term_count),
+    ("L1_intensity",      "lambda_L1",              _loss_term_L1_intensity),
+    ("coverage",          "lambda_coverage",        _loss_term_coverage),
+    ("gradient",          "lambda_grad",            _loss_term_gradient),
 )
 
 
-def _make_loss_context(pred, gt, gc, cfg, dataset) -> _LossContext:
+def _make_loss_context(pred, gt, gc, cfg, dataset, step: int = 0) -> _LossContext:
     """Pre-compute shared quantities and pack them into a _LossContext.
 
-    s_max is computed once here rather than inside each term function that
-    needs it, because torch.exp + max is not free.
+    Both s_max and s_min are derived from the same exp(log_s) call so the
+    tensor is only materialised once.
     """
+    s = torch.exp(gc.log_s)
     return _LossContext(
         pred    = pred,
         gt      = gt,
         gc      = gc,
         cfg     = cfg,
         dataset = dataset,
-        s_max   = torch.exp(gc.log_s).max(-1).values,
+        s_max   = s.max(-1).values,
+        s_min   = s.min(-1).values,
+        step    = step,
     )
 
 
@@ -1032,7 +1335,7 @@ def _compute_loss_terms(ctx: _LossContext) -> tuple[torch.Tensor, dict[str, torc
     return total, terms
 
 
-def compute_loss(pred, gt, gc, cfg, dataset):
+def compute_loss(pred, gt, gc, cfg, dataset, step: int = 0):
     """Compute the total training loss and return individual term values.
 
     Public entry point used by the training loop.  Builds the context,
@@ -1043,7 +1346,7 @@ def compute_loss(pred, gt, gc, cfg, dataset):
     total : scalar tensor for loss.backward().
     stats : dict mapping term name → scalar tensor, for logging.
     """
-    total, terms = _compute_loss_terms(_make_loss_context(pred, gt, gc, cfg, dataset))
+    total, terms = _compute_loss_terms(_make_loss_context(pred, gt, gc, cfg, dataset, step=step))
     terms['loss'] = total
     return total, terms
 
@@ -1109,12 +1412,36 @@ class VolumeDataset:
         self.aabb          = aabb
 
         if swc_path is not None:
-            swc = load_swc(swc_path)
+            swc_full = load_swc_full(swc_path)
             self.swc_unit = torch.from_numpy(
-                swc_points_to_unit_aabb(swc[:, :3], volume.shape)
+                swc_points_to_unit_aabb(swc_full[:, 1:4], volume.shape)
             ).float()
+            self.swc_ids        = torch.from_numpy(swc_full[:, 0]).long()
+            self.swc_parent_ids = torch.from_numpy(swc_full[:, 5]).long()
         else:
-            self.swc_unit = None
+            self.swc_unit       = None
+            self.swc_ids        = None
+            self.swc_parent_ids = None
+
+        # Importance sampling CDF: mix of intensity + gradient magnitude.
+        # grad_sample_weight (default 0) = fraction of probability mass given to edges.
+        # At 0.0 this is the original intensity-only CDF; at 0.5 it samples edges
+        # as often as bright foreground, which improves soma boundary reconstruction.
+        flat = volume.reshape(-1).float()
+        grad_w = float(getattr(cfg, 'grad_sample_weight', 0.0))
+        if grad_w > 0.0:
+            # Central-difference gradient magnitude, zero-padded at boundaries.
+            gx = torch.zeros_like(volume)
+            gy = torch.zeros_like(volume)
+            gz = torch.zeros_like(volume)
+            gx[:, :, 1:-1] = (volume[:, :, 2:] - volume[:, :, :-2]) * 0.5
+            gy[:, 1:-1, :] = (volume[:, 2:, :] - volume[:, :-2, :]) * 0.5
+            gz[1:-1, :, :] = (volume[2:, :, :] - volume[:-2, :, :]) * 0.5
+            grad_mag = (gx.pow(2) + gy.pow(2) + gz.pow(2)).sqrt().reshape(-1)
+            probs = (1.0 - grad_w) * (flat + 0.1) + grad_w * (grad_mag + 0.01)
+        else:
+            probs = flat + 0.1
+        self._sample_cdf = torch.cumsum(probs / probs.sum(), dim=0).cpu()
 
     def _indices_to_pts(self, id_, ih, iw, device) -> torch.Tensor:
         """Convert integer voxel indices (z, y, x) into AABB coordinates.
@@ -1142,15 +1469,100 @@ class VolumeDataset:
                              align_corners=True).view(n)
         return pts, gt
 
+    def sample_importance(self, n: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draw n points biased toward bright voxels using the precomputed CDF.
+
+        Uses inverse-CDF sampling on the flattened volume.  Each drawn index
+        maps to the centre of a voxel, so GT is a direct lookup (no interpolation
+        error).  Bright voxels are sampled ~10x more often than dark background.
+        """
+        u    = torch.rand(n)
+        idxs = torch.searchsorted(self._sample_cdf, u).clamp(0, self._sample_cdf.numel() - 1)
+        iz   = (idxs // (self.H * self.W)).long()
+        ih   = ((idxs % (self.H * self.W)) // self.W).long()
+        iw   = (idxs % self.W).long()
+        pts  = self._indices_to_pts(iz, ih, iw, device)
+        gt   = self.vol[iz, ih, iw].to(device)
+        return pts, gt
+
     def sample(self, n: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
         """Main sampling interface called by the training loop each step."""
-        return self.sample_uniform(n, device)
+        return self.sample_importance(n, device)
 
     def swc_init_points(self) -> torch.Tensor:
         """Return SWC skeleton points in [-1,1]³, or an empty (0,3) tensor."""
         if self.swc_unit is None:
             return torch.empty(0, 3)
         return self.swc_unit
+
+    def swc_oriented_init_params(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (positions, quats) with Gaussian x-axis aligned to the branch direction.
+
+        For each SWC node that has a parent, the initial quaternion rotates [1,0,0]
+        to the parent→child direction in unit-AABB space.  Root nodes (parent_id < 0)
+        receive identity quaternions.
+
+        Returns
+        -------
+        pts   : (N, 3)  positions in [-1, 1]³
+        quats : (N, 4)  initial orientations [w, x, y, z]
+        """
+        if self.swc_unit is None:
+            return torch.empty(0, 3), torch.empty(0, 4)
+
+        pts  = self.swc_unit          # (N, 3)
+        N    = pts.shape[0]
+        ids  = self.swc_ids           # (N,) int64 node IDs
+        pids = self.swc_parent_ids    # (N,) int64 parent IDs
+
+        id_to_row = {int(ids[i].item()): i for i in range(N)}
+
+        quats = torch.zeros(N, 4)
+        quats[:, 0] = 1.0            # default: identity [1,0,0,0]
+
+        for i in range(N):
+            pid = int(pids[i].item())
+            if pid < 0 or pid not in id_to_row:
+                continue             # root node
+            pr = id_to_row[pid]
+            d  = pts[i] - pts[pr]   # parent→child in AABB coords
+            ln = d.norm().item()
+            if ln < 1e-8:
+                continue             # coincident nodes
+            d = d / ln
+            dx, dy, dz = d[0].item(), d[1].item(), d[2].item()
+
+            if dx > 0.9999:          # already along +x → identity
+                pass
+            elif dx < -0.9999:       # antiparallel → 180° around z-axis
+                quats[i] = torch.tensor([0.0, 0.0, 0.0, 1.0])
+            else:
+                # q = normalize([1+dx, 0, -dz, dy]): rotates [1,0,0] → d
+                q = torch.tensor([1.0 + dx, 0.0, -dz, dy])
+                quats[i] = F.normalize(q, dim=-1)
+
+        return pts, quats
+
+    def interior_init_points(self, n: int, thresh: float = 0.3) -> torch.Tensor:
+        """Sample n random points from interior voxels (gt > thresh) in [-1,1]³.
+
+        Used to seed Gaussians inside the soma volume, which the SWC centerline
+        does not cover. thresh=0.3 targets the bright soma interior specifically.
+        """
+        flat   = self.vol.reshape(-1)
+        mask   = (flat >= thresh).nonzero(as_tuple=False).squeeze(1)
+        if mask.numel() == 0:
+            return torch.empty(0, 3)
+        idx    = mask[torch.randint(0, mask.numel(), (min(n, mask.numel()),))]
+        D, H, W = self.D, self.H, self.W
+        iz = (idx // (H * W)).long()
+        ih = ((idx % (H * W)) // W).long()
+        iw = (idx % W).long()
+        lo, hi = self.aabb.lo, self.aabb.hi
+        x = lo[0] + (iw.float() / max(W - 1, 1)) * (hi[0] - lo[0])
+        y = lo[1] + (ih.float() / max(H - 1, 1)) * (hi[1] - lo[1])
+        z = lo[2] + (iz.float() / max(D - 1, 1)) * (hi[2] - lo[2])
+        return torch.stack([x, y, z], dim=-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1252,6 +1664,221 @@ def eval_slice(gc: GaussianCloud, dataset: VolumeDataset,
     pts   = pts.reshape(-1, 3).to(gc.device)
     pred  = gc.forward(pts, chunk_n=cfg.chunk_n).clamp(0.0, 1.0)
     return pred.reshape(H, W).cpu()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Splatting-based rendering with MIP projection
+# ─────────────────────────────────────────────────────────────────────────────
+# Why splatting?  Different from voxel-based volumetric reconstruction,
+# splatting projects 3D Gaussians onto 2D image planes and accumulates their
+# contributions per-pixel.  This enables view-dependent rendering and MIP
+# visualization from arbitrary viewpoints.
+#
+# MIP (Maximum Intensity Projection) finds the maximum intensity along each
+# depth ray, giving a natural way to visualise thin structures (neurites)
+# without explicit rendering of intermediate slices.
+#%%
+@torch.no_grad()
+def splat_to_image(gc: GaussianCloud, dataset: VolumeDataset,
+                   cfg: argparse.Namespace, view_axis: str = 'z',
+                   img_h: int = 256, img_w: int = 256,
+                   depth_samples: int = 32) -> torch.Tensor:
+    """Project 3D Gaussians onto a 2D image via efficient splatting.
+
+    Samples depths uniformly and evaluates Gaussian field at each depth.
+    Uses chunking to manage memory; compatible with large volumes.
+
+    Parameters
+    ----------
+    gc          : GaussianCloud with learned Gaussian parameters.
+    dataset     : VolumeDataset containing volume dimensions and AABB.
+    cfg         : config namespace.
+    view_axis   : 'x', 'y', or 'z' — which axis to view down (depth direction).
+    img_h, img_w: output image resolution.
+    depth_samples: number of depths to sample (default 32 for speed).
+
+    Returns
+    -------
+    (depth_samples, img_h, img_w) tensor of Gaussian field evaluations.
+    """
+    device = gc.device
+    lo, hi = gc.aabb.lo.to(device), gc.aabb.hi.to(device)
+    
+    # Build coordinate grids for the output image plane
+    if view_axis == 'z':
+        # Looking down Z; project onto XY plane
+        yg, xg = torch.meshgrid(
+            torch.linspace(float(lo[1]), float(hi[1]), img_h),
+            torch.linspace(float(lo[0]), float(hi[0]), img_w),
+            indexing='ij',
+        )
+        yg, xg = yg.to(device), xg.to(device)
+        zg_vals = torch.linspace(float(lo[2]), float(hi[2]), depth_samples)
+        image_stack = []
+        
+        for z_val in zg_vals:
+            pts = torch.stack([xg, yg, torch.full_like(xg, z_val)], dim=-1)
+            pts = pts.reshape(-1, 3)
+            
+            # Batch evaluate with chunking
+            chunk_size = 32768
+            slice_result = []
+            for s in range(0, pts.shape[0], chunk_size):
+                e = min(s + chunk_size, pts.shape[0])
+                chunk_pts = pts[s:e]
+                intensities = gc.forward(chunk_pts, chunk_n=cfg.chunk_n).clamp(0.0, 1.0)
+                slice_result.append(intensities)
+            
+            full_slice = torch.cat(slice_result, dim=0).reshape(img_h, img_w)
+            image_stack.append(full_slice)
+        return torch.stack(image_stack, dim=0)
+    
+    elif view_axis == 'y':
+        # Looking down Y; project onto XZ plane
+        zg, xg = torch.meshgrid(
+            torch.linspace(float(lo[2]), float(hi[2]), img_h),
+            torch.linspace(float(lo[0]), float(hi[0]), img_w),
+            indexing='ij',
+        )
+        zg, xg = zg.to(device), xg.to(device)
+        yg_vals = torch.linspace(float(lo[1]), float(hi[1]), depth_samples)
+        image_stack = []
+        
+        for y_val in yg_vals:
+            pts = torch.stack([xg, torch.full_like(xg, y_val), zg], dim=-1)
+            pts = pts.reshape(-1, 3)
+            
+            chunk_size = 32768
+            slice_result = []
+            for s in range(0, pts.shape[0], chunk_size):
+                e = min(s + chunk_size, pts.shape[0])
+                chunk_pts = pts[s:e]
+                intensities = gc.forward(chunk_pts, chunk_n=cfg.chunk_n).clamp(0.0, 1.0)
+                slice_result.append(intensities)
+            
+            full_slice = torch.cat(slice_result, dim=0).reshape(img_h, img_w)
+            image_stack.append(full_slice)
+        return torch.stack(image_stack, dim=0)
+    
+    else:  # view_axis == 'x'
+        # Looking down X; project onto YZ plane
+        zg, yg = torch.meshgrid(
+            torch.linspace(float(lo[2]), float(hi[2]), img_h),
+            torch.linspace(float(lo[1]), float(hi[1]), img_w),
+            indexing='ij',
+        )
+        zg, yg = zg.to(device), yg.to(device)
+        xg_vals = torch.linspace(float(lo[0]), float(hi[0]), depth_samples)
+        image_stack = []
+        
+        for x_val in xg_vals:
+            pts = torch.stack([torch.full_like(yg, x_val), yg, zg], dim=-1)
+            pts = pts.reshape(-1, 3)
+            
+            chunk_size = 32768
+            slice_result = []
+            for s in range(0, pts.shape[0], chunk_size):
+                e = min(s + chunk_size, pts.shape[0])
+                chunk_pts = pts[s:e]
+                intensities = gc.forward(chunk_pts, chunk_n=cfg.chunk_n).clamp(0.0, 1.0)
+                slice_result.append(intensities)
+            
+            full_slice = torch.cat(slice_result, dim=0).reshape(img_h, img_w)
+            image_stack.append(full_slice)
+        return torch.stack(image_stack, dim=0)
+
+
+@torch.no_grad()
+def compute_mip_from_stack(image_stack: torch.Tensor, axis: int = 0) -> torch.Tensor:
+    """Compute Maximum Intensity Projection from a depth stack.
+
+    Takes the maximum along the depth dimension, returning a single 2D image
+    where each pixel holds the brightest voxel along the corresponding ray.
+
+    Parameters
+    ----------
+    image_stack : (D, H, W) or (H, W, D) tensor depending on axis.
+    axis        : which axis to max over (0 for depth-first layout).
+
+    Returns
+    -------
+    (H, W) 2D MIP image.
+    """
+    return torch.max(image_stack, dim=axis).values
+
+
+@torch.no_grad()
+def render_splatted_mips(gc: GaussianCloud, dataset: VolumeDataset,
+                         cfg: argparse.Namespace,
+                         depth_samples: int = 32) -> dict:
+    """Render MIP projections from three orthogonal viewpoints using splatting.
+
+    Output dimensions match the volume exactly (no downsampling):
+      'xy' : (H, W)  — looking down Z
+      'xz' : (D, W)  — looking down Y
+      'yz' : (D, H)  — looking down X
+
+    On CUDA: uses the fused splat_mip kernel (single launch per view).
+    On CPU:  falls back to the chunked Python implementation.
+
+    Parameters
+    ----------
+    depth_samples : depth positions sampled per ray (trades speed vs accuracy).
+    """
+    D, H, W = dataset.D, dataset.H, dataset.W
+    mips    = {}
+
+    if gc.device.type == 'cuda':
+        kernel = _load_eval_kernel()
+        lo = gc.aabb.lo.cpu()
+        hi = gc.aabb.hi.cpu()
+        lo_x, hi_x = float(lo[0]), float(hi[0])
+        lo_y, hi_y = float(lo[1]), float(hi[1])
+        lo_z, hi_z = float(lo[2]), float(hi[2])
+        means_c    = gc.means.contiguous()
+        log_s_c    = gc.log_s.contiguous()
+        quats_c    = gc.quats.contiguous()
+        inten_c    = gc.inten.contiguous()
+        scale_min  = float(gc.scale_min)
+        mahal_clamp = float(gc.mahal_clamp)
+
+        print(f'  Rendering XY MIP ({depth_samples} depth samples at {H}×{W}) [CUDA]...')
+        flat = kernel.splat_mip(means_c, log_s_c, quats_c, inten_c,
+                                lo_x, hi_x, lo_y, hi_y, lo_z, hi_z,
+                                H, W, depth_samples, 0, scale_min, mahal_clamp)
+        mips['xy'] = flat.reshape(H, W)
+
+        print(f'  Rendering XZ MIP ({depth_samples} depth samples at {D}×{W}) [CUDA]...')
+        flat = kernel.splat_mip(means_c, log_s_c, quats_c, inten_c,
+                                lo_x, hi_x, lo_y, hi_y, lo_z, hi_z,
+                                D, W, depth_samples, 1, scale_min, mahal_clamp)
+        mips['xz'] = flat.reshape(D, W)
+
+        print(f'  Rendering YZ MIP ({depth_samples} depth samples at {D}×{H}) [CUDA]...')
+        flat = kernel.splat_mip(means_c, log_s_c, quats_c, inten_c,
+                                lo_x, hi_x, lo_y, hi_y, lo_z, hi_z,
+                                D, H, depth_samples, 2, scale_min, mahal_clamp)
+        mips['yz'] = flat.reshape(D, H)
+
+        torch.cuda.empty_cache()
+
+    else:
+        print(f'  Rendering XY MIP ({depth_samples} depth samples at {H}×{W}) [CPU]...')
+        stack_xy = splat_to_image(gc, dataset, cfg, view_axis='z',
+                                  img_h=H, img_w=W, depth_samples=depth_samples)
+        mips['xy'] = compute_mip_from_stack(stack_xy, axis=0)
+
+        print(f'  Rendering XZ MIP ({depth_samples} depth samples at {D}×{W}) [CPU]...')
+        stack_xz = splat_to_image(gc, dataset, cfg, view_axis='y',
+                                  img_h=D, img_w=W, depth_samples=depth_samples)
+        mips['xz'] = compute_mip_from_stack(stack_xz, axis=0)
+
+        print(f'  Rendering YZ MIP ({depth_samples} depth samples at {D}×{H}) [CPU]...')
+        stack_yz = splat_to_image(gc, dataset, cfg, view_axis='x',
+                                  img_h=D, img_w=H, depth_samples=depth_samples)
+        mips['yz'] = compute_mip_from_stack(stack_yz, axis=0)
+
+    return mips
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1386,6 +2013,43 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda_scale_ceiling", type=float, default=1e-3)
     p.add_argument("--lambda_scale_outlier", type=float, default=5e-4)
     p.add_argument("--scale_max_hard",       type=float, default=None)
+    p.add_argument("--scale_min_hard",       type=float, default=None)
+    p.add_argument("--lambda_aniso",  type=float, default=0.0,
+                   help="L2 penalty on min per-axis scale; encourages elongated ellipsoids")
+    p.add_argument("--lambda_count",  type=float, default=0.0,
+                   help="Soft-L0 count penalty (mean sigmoid of raw intensities)")
+    p.add_argument("--lambda_L1",     type=float, default=0.0,
+                   help="L1 intensity penalty (mean softplus(raw)); finishes off zombie Gaussians")
+    p.add_argument("--lambda_coverage", type=float, default=0.0,
+                   help="Coverage reward: -log(s_max/init_scale); rewards large elongated ellipsoids")
+    p.add_argument("--lambda_ssim",   type=float, default=0.2,
+                   help="Weight of SSIM slice loss in the reconstruction term (GaussianPile)")
+    p.add_argument("--lambda_grad",   type=float, default=0.0,
+                   help="Weight of gradient sharpness loss on Z-slice crops (edge preservation)")
+    p.add_argument("--grad_sample_weight", type=float, default=0.0,
+                   help="Fraction of importance-sampling CDF mass given to high-gradient voxels (0=off, 0.5=equal mix)")
+    p.add_argument("--interior_init_n", type=int, default=0,
+                   help="Extra Gaussians seeded at bright interior voxels to fill the soma (0=off)")
+    p.add_argument("--interior_init_thresh", type=float, default=0.3,
+                   help="Intensity threshold for interior_init_n (voxels with gt > thresh are eligible)")
+    p.add_argument("--swc_oriented_init",    dest="swc_oriented_init", action="store_true",
+                   help="Align initial Gaussian x-axis with the SWC branch direction at each node")
+    p.add_argument("--no_swc_oriented_init", dest="swc_oriented_init", action="store_false")
+    p.set_defaults(swc_oriented_init=False)
+    p.add_argument("--log_intensity_loss", dest="log_intensity_loss", action="store_true",
+                   help="Compute L1 in log1p space to de-emphasise bright soma, amplify dim dendrites")
+    p.add_argument("--no_log_intensity_loss", dest="log_intensity_loss", action="store_false")
+    p.set_defaults(log_intensity_loss=False)
+    p.add_argument("--ssim_crop",       type=int,   default=64,
+                   help="Side length of random Z-crop used to compute SSIM each step")
+    p.add_argument("--ssim_start_step", type=int,   default=0,
+                   help="Activate SSIM loss only after this many optimizer steps; "
+                        "set to densify_until_step to prevent SSIM from inflating _grad_acc")
+    p.add_argument("--init_scale_z_factor", type=float, default=1.0,
+                   help="Multiply z-axis init_scale by this factor (PSF anisotropy correction; "
+                        "set to (W-1)/(D-1) for confocal volumes)")
+    p.add_argument("--prune_inten_thresh", type=float, default=1e-3,
+                   help="Remove Gaussians with softplus(inten) below this during densify")
 
     # ── Adaptive density control ───────────────────────────────────────────────
     p.add_argument("--densify_from_step",   type=int,   default=500)
@@ -1393,14 +2057,14 @@ def parse_args() -> argparse.Namespace:
                    help="Stop densification after this optimizer step; unset keeps it active to the end")
     p.add_argument("--densify_interval",    type=int,   default=200)
     p.add_argument("--densify_grad_thresh", type=float, default=2e-4)
-    p.add_argument("--densify_max_scale",   type=float, default=0.10)
+    p.add_argument("--densify_max_scale",   type=float, default=0.04)
     p.add_argument("--split_scale_divisor", type=float, default=1.6,
                    help="Scale shrink factor applied to split daughters")
     p.add_argument("--log_scale_floor",     type=float, default=-6.0,
                    help="Minimum log-scale after split")
 
     # ── Evaluation / logging ───────────────────────────────────────────────────
-    p.add_argument("--eval_samples",         type=int,  default=20_000)
+    p.add_argument("--eval_samples",         type=int,  default=200_000)
     p.add_argument("--log_interval",         type=int,  default=10)
     p.add_argument("--eval_detail_interval", type=int,  default=5)
     p.add_argument("--swc_path",             type=str,  default=None)

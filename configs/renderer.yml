@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# renderer.yml — INR Volume Renderer configuration
+#
+# Load with:
+#   import yaml
+#   cfg = yaml.safe_load(open('configs/renderer.yml'))
+# ─────────────────────────────────────────────────────────────────────────────
+
+device: cuda
+
+# ── Query chunking (memory budget per forward pass) ───────────────────────────
+chunk:
+  siren:    262144    # 2^18  — MLP is memory-light
+  nerf:     262144
+  rff:      262144
+  ingp:    1048576    # 2^20  — hash lookup is fast and lightweight
+  3dgs:      65536    # 2^16  — Gaussian kernel is heavy per voxel
+
+# ── Rendering defaults ────────────────────────────────────────────────────────
+render:
+  resolution:  512        # output image resolution (H = W = resolution)
+  n_samples:   256        # ray samples for DVR and MIP
+  background:  [0, 0, 0]  # RGB background colour (0–1)
+
+# ── Transfer function preset ──────────────────────────────────────────────────
+# Options: gray | hot | fluorescence | cell_body | custom
+transfer_function: fluorescence
+
+# ── Tiling for huge volumes ───────────────────────────────────────────────────
+tiling:
+  enabled:    false
+  grid:       [2, 2, 2]   # Nx × Ny × Nz tiles
+  cache_size: 8            # max tiles kept in GPU memory (LRU eviction)
+
+# ── Level of detail ───────────────────────────────────────────────────────────
+lod:
+  enabled:      false
+  # resolutions matched to trained INR checkpoints, coarse → fine
+  resolutions:  [64, 256, 512]
+  # paths to INR checkpoints, one per LOD level (same method)
+  checkpoints:
+    - best_trained/rec_best_vol/ingp_rec.npy   # placeholder — swap for .pth
+    - best_trained/rec_best_vol/ingp_rec.npy
+    - best_trained/rec_best_vol/ingp_rec.npy
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output:
+  dir:    figures/renders/
+  prefix: inr_render
+  dpi:    150

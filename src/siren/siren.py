@@ -47,7 +47,6 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
 
 USE_CUDA_KERNEL = False  # toggled by --use-kernel CLI flag
 
@@ -169,6 +168,8 @@ def train(model, train_dataloader, epochs, lr, steps_til_summary, epochs_til_che
           summary_fn, val_dataloader=None, double_precision=False, clip_grad=False, use_lbfgs=False,
           loss_schedules=None, early_stopping_patience=50, use_amp=True, compile_model=False,
           wandb_run=None, run_config=None, resume=False):
+
+    from torch.utils.tensorboard import SummaryWriter
 
     if compile_model:
         try:
