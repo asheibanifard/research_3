@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 from typing import NamedTuple, Tuple
 
@@ -31,6 +32,14 @@ import yaml
 import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
+
+# When this script is run directly (python src/_3dgs/_3dgs.py), Python adds
+# src/_3dgs/ to sys.path.  That makes the _3dgs.py file itself shadow the
+# _3dgs/ package, so "from _3dgs._3dgs_training import" fails with
+# "_3dgs is not a package".  Inserting src/ first ensures the package dir wins.
+_src_dir = str(Path(__file__).resolve().parent.parent)
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
 
 # Training loop lives in a separate module so it can be unit-tested and reused
 # without importing the full model stack.  This file wires all components
@@ -283,10 +292,11 @@ def load_swc(path: str) -> np.ndarray:
 
 
 def load_swc_full(path: str) -> np.ndarray:
-    """Parse an SWC file and return (N, 6) float32: [node_id, x, y, z, radius, parent_id].
+    """Parse an SWC file and return (N, 7) float32: [node_id, type, x, y, z, radius, parent_id].
 
     Unlike load_swc, the node ID is preserved as column 0 so that parent-child
     direction vectors can be computed for oriented Gaussian initialisation.
+    Column 1 is the SWC node type (1=soma, 2=axon, 3/4=dendrite, 5=fork).
     """
     rows = []
     with open(path) as f:
@@ -299,6 +309,7 @@ def load_swc_full(path: str) -> np.ndarray:
                 continue
             rows.append([
                 int(float(parts[0])),   # node id
+                int(float(parts[1])),   # type (1=soma, 2=axon, 3/4=dendrite)
                 float(parts[2]),        # x (voxel index)
                 float(parts[3]),        # y
                 float(parts[4]),        # z
@@ -1027,14 +1038,15 @@ class _LossContext(NamedTuple):
     Computed once per step by _make_loss_context() and shared across all
     term functions to avoid redundant computation.
     """
-    pred:    torch.Tensor       # (M,) model prediction
-    gt:      torch.Tensor       # (M,) ground-truth intensities
-    gc:      "GaussianCloud"
-    cfg:     argparse.Namespace
-    dataset: "VolumeDataset"
-    s_max:   torch.Tensor       # (N,) per-Gaussian max axis scale
-    s_min:   torch.Tensor       # (N,) per-Gaussian min axis scale
-    step:    int = 0            # current global optimizer step (for conditional losses)
+    pred:           torch.Tensor       # (M,) model prediction
+    gt:             torch.Tensor       # (M,) ground-truth intensities
+    gc:             "GaussianCloud"
+    cfg:            argparse.Namespace
+    dataset:        "VolumeDataset"
+    s_max:          torch.Tensor       # (N,) per-Gaussian max axis scale
+    s_min:          torch.Tensor       # (N,) per-Gaussian min axis scale
+    step:           int = 0            # current global optimizer step
+    sample_weights: "torch.Tensor | None" = None  # (M,) SWC-type loss weights
 
 
 def _ssim_2d(pred: torch.Tensor, gt: torch.Tensor, window: int = 11) -> torch.Tensor:
@@ -1123,9 +1135,16 @@ def _loss_term_mse(ctx: _LossContext) -> torch.Tensor:
         # dendrites (x≈0.2), naturally rebalancing attention.
         pred_l = torch.log1p(ctx.pred.clamp(0, 1))
         gt_l   = torch.log1p(ctx.gt.clamp(0, 1))
-        l1 = F.l1_loss(pred_l, gt_l)
+        residuals = (pred_l - gt_l).abs()
     else:
-        l1 = F.l1_loss(ctx.pred, ctx.gt)
+        residuals = (ctx.pred - ctx.gt).abs()
+
+    # SWC-type spatial weighting: upweights dendrites, downweights soma.
+    if ctx.sample_weights is not None:
+        w  = ctx.sample_weights.to(residuals.device)
+        l1 = (w * residuals).sum() / w.sum()
+    else:
+        l1 = residuals.mean()
     ssim_start = int(getattr(ctx.cfg, 'ssim_start_step', 0))
     if ctx.step >= ssim_start:
         lssim = _ssim_slice_loss(ctx.gc, ctx.dataset, ctx.cfg)
@@ -1295,7 +1314,8 @@ _LOSS_TERM_SPECS = (
 )
 
 
-def _make_loss_context(pred, gt, gc, cfg, dataset, step: int = 0) -> _LossContext:
+def _make_loss_context(pred, gt, gc, cfg, dataset, step: int = 0,
+                       sample_weights=None) -> _LossContext:
     """Pre-compute shared quantities and pack them into a _LossContext.
 
     Both s_max and s_min are derived from the same exp(log_s) call so the
@@ -1303,14 +1323,15 @@ def _make_loss_context(pred, gt, gc, cfg, dataset, step: int = 0) -> _LossContex
     """
     s = torch.exp(gc.log_s)
     return _LossContext(
-        pred    = pred,
-        gt      = gt,
-        gc      = gc,
-        cfg     = cfg,
-        dataset = dataset,
-        s_max   = s.max(-1).values,
-        s_min   = s.min(-1).values,
-        step    = step,
+        pred           = pred,
+        gt             = gt,
+        gc             = gc,
+        cfg            = cfg,
+        dataset        = dataset,
+        s_max          = s.max(-1).values,
+        s_min          = s.min(-1).values,
+        step           = step,
+        sample_weights = sample_weights,
     )
 
 
@@ -1335,18 +1356,25 @@ def _compute_loss_terms(ctx: _LossContext) -> tuple[torch.Tensor, dict[str, torc
     return total, terms
 
 
-def compute_loss(pred, gt, gc, cfg, dataset, step: int = 0):
+def compute_loss(pred, gt, gc, cfg, dataset, step: int = 0, sample_weights=None):
     """Compute the total training loss and return individual term values.
 
     Public entry point used by the training loop.  Builds the context,
     runs the dispatch table, and appends 'loss' (the total) to the stats dict.
+
+    sample_weights : (M,) float tensor of per-sample loss weights, or None.
+        When provided (e.g. SWC-type weights from VolumeDataset.sample()),
+        the L1 reconstruction term is weighted element-wise before averaging.
 
     Returns
     -------
     total : scalar tensor for loss.backward().
     stats : dict mapping term name → scalar tensor, for logging.
     """
-    total, terms = _compute_loss_terms(_make_loss_context(pred, gt, gc, cfg, dataset, step=step))
+    total, terms = _compute_loss_terms(
+        _make_loss_context(pred, gt, gc, cfg, dataset, step=step,
+                           sample_weights=sample_weights)
+    )
     terms['loss'] = total
     return total, terms
 
@@ -1413,15 +1441,25 @@ class VolumeDataset:
 
         if swc_path is not None:
             swc_full = load_swc_full(swc_path)
+            # Column layout: [node_id, type, x, y, z, radius, parent_id]
             self.swc_unit = torch.from_numpy(
-                swc_points_to_unit_aabb(swc_full[:, 1:4], volume.shape)
+                swc_points_to_unit_aabb(swc_full[:, 2:5], volume.shape)
             ).float()
             self.swc_ids        = torch.from_numpy(swc_full[:, 0]).long()
-            self.swc_parent_ids = torch.from_numpy(swc_full[:, 5]).long()
+            self.swc_types      = torch.from_numpy(swc_full[:, 1]).long()
+            self.swc_parent_ids = torch.from_numpy(swc_full[:, 6]).long()
+            # Soma center in [-1,1]^3: mean of all type-1 (soma) nodes.
+            soma_mask = (self.swc_types == 1)
+            if soma_mask.any():
+                self.soma_center = self.swc_unit[soma_mask].mean(0)  # (3,)
+            else:
+                self.soma_center = None
         else:
             self.swc_unit       = None
             self.swc_ids        = None
+            self.swc_types      = None
             self.swc_parent_ids = None
+            self.soma_center    = None
 
         # Importance sampling CDF: mix of intensity + gradient magnitude.
         # grad_sample_weight (default 0) = fraction of probability mass given to edges.
@@ -1456,25 +1494,48 @@ class VolumeDataset:
         x  = lo[0] + (iw.float() / (self.W - 1)) * (hi[0] - lo[0])
         return torch.stack([x, y, z], dim=-1).to(device)
 
-    def sample_uniform(self, n: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _soma_weights(self, pts: torch.Tensor, cfg) -> torch.Tensor:
+        """Per-sample loss weights derived from distance to the soma centroid.
+
+        Voxels inside the soma (distance < soma_weight_radius) receive a lower
+        weight (soma_loss_scale) so the loss gradient is not dominated by the
+        bright, easily-fit soma at the expense of dim distal dendrites.
+        Voxels outside receive dendrite_loss_scale (> 1).  The transition is
+        linear in distance, giving a smooth gradient rather than a hard step.
+
+        Returns ones (uniform weights) when no SWC soma nodes are available.
+        """
+        if self.soma_center is None:
+            return torch.ones(pts.shape[0], device=pts.device)
+        soma_r = float(getattr(cfg, 'soma_weight_radius',  0.15))
+        w_soma = float(getattr(cfg, 'soma_loss_scale',     0.3))
+        w_dend = float(getattr(cfg, 'dendrite_loss_scale', 1.5))
+        dist   = (pts - self.soma_center.to(pts.device)).norm(dim=-1)
+        t      = (dist / soma_r).clamp(0.0, 1.0)   # 0 at soma, ≥1 outside
+        return w_soma + (w_dend - w_soma) * t
+
+    def sample_uniform(self, n: int, device, cfg=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Draw n query points uniformly from the AABB with trilinear GT.
 
         The (1,1,1,n,3) grid layout is required by the 5-D grid_sample API
         (batch, channel, depth, height → here collapsed to 1, width = n).
+        Returns (pts, gt, sample_weights).
         """
         pts  = self.aabb.random_pts(n, device)                     # (n, 3)
         vol  = self.vol.unsqueeze(0).unsqueeze(0).to(device)       # (1,1,D,H,W)
         grid = pts.view(1, 1, 1, n, 3)                             # (1,1,1,n,3)
         gt   = F.grid_sample(vol, grid, mode='bilinear',
                              align_corners=True).view(n)
-        return pts, gt
+        w    = self._soma_weights(pts, cfg) if cfg is not None else torch.ones(n, device=device)
+        return pts, gt, w
 
-    def sample_importance(self, n: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample_importance(self, n: int, device, cfg=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Draw n points biased toward bright voxels using the precomputed CDF.
 
         Uses inverse-CDF sampling on the flattened volume.  Each drawn index
         maps to the centre of a voxel, so GT is a direct lookup (no interpolation
         error).  Bright voxels are sampled ~10x more often than dark background.
+        Returns (pts, gt, sample_weights).
         """
         u    = torch.rand(n)
         idxs = torch.searchsorted(self._sample_cdf, u).clamp(0, self._sample_cdf.numel() - 1)
@@ -1483,11 +1544,14 @@ class VolumeDataset:
         iw   = (idxs % self.W).long()
         pts  = self._indices_to_pts(iz, ih, iw, device)
         gt   = self.vol[iz, ih, iw].to(device)
-        return pts, gt
+        w    = self._soma_weights(pts, cfg) if cfg is not None else torch.ones(n, device=device)
+        return pts, gt, w
 
-    def sample(self, n: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Main sampling interface called by the training loop each step."""
-        return self.sample_importance(n, device)
+    def sample(self, n: int, device, cfg=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Main sampling interface called by the training loop each step.
+        Returns (pts, gt, sample_weights).
+        """
+        return self.sample_importance(n, device, cfg=cfg)
 
     def swc_init_points(self) -> torch.Tensor:
         """Return SWC skeleton points in [-1,1]³, or an empty (0,3) tensor."""
@@ -1583,7 +1647,7 @@ def psnr_on_samples(gc: GaussianCloud, dataset: VolumeDataset,
     Cheap enough to run every epoch.  Predictions clamped to [0,1] before
     MSE to match the GT range.  Returns inf on perfect reconstruction.
     """
-    pts, gt = dataset.sample_uniform(cfg.eval_samples, gc.device)
+    pts, gt, _ = dataset.sample_uniform(cfg.eval_samples, gc.device)
     pred    = gc.forward(pts, chunk_n=cfg.chunk_n)
     mse     = F.mse_loss(pred.clamp(0.0, 1.0), gt)
     return float('inf') if mse == 0 else -10.0 * math.log10(mse.item())
@@ -1619,7 +1683,7 @@ def vol_psnr(gc: GaussianCloud, dataset: VolumeDataset,
         pred_all = torch.cat(pts_list)
         gt_all   = torch.cat(gt_list)
     else:
-        pts, gt  = dataset.sample_uniform(cfg.eval_samples, device)
+        pts, gt, _ = dataset.sample_uniform(cfg.eval_samples, device)
         pred_all = gc.forward(pts, chunk_n=cfg.chunk_n)
         gt_all   = gt
 
@@ -2039,6 +2103,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log_intensity_loss", dest="log_intensity_loss", action="store_true",
                    help="Compute L1 in log1p space to de-emphasise bright soma, amplify dim dendrites")
     p.add_argument("--no_log_intensity_loss", dest="log_intensity_loss", action="store_false")
+    p.add_argument("--soma_loss_scale",     type=float, default=0.3,
+                   help="Loss weight for voxels at the soma centre (< 1 downweights soma)")
+    p.add_argument("--dendrite_loss_scale", type=float, default=1.5,
+                   help="Loss weight for voxels far from soma (> 1 upweights dendrites)")
+    p.add_argument("--soma_weight_radius",  type=float, default=0.15,
+                   help="Linear ramp radius from soma centre in [-1,1]^3 normalised coords")
     p.set_defaults(log_intensity_loss=False)
     p.add_argument("--ssim_crop",       type=int,   default=64,
                    help="Side length of random Z-crop used to compute SSIM each step")

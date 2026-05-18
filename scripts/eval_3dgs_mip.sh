@@ -4,13 +4,13 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
 
-RUN_DIR="$ROOT/logs/3dgs/run15/20260515_100118/"
-CKPT="$ROOT/logs/3dgs/run15/20260515_100118/best_20260515_100118.pth
+RUN_DIR="$ROOT/logs/3dgs/run16/20260515_141812"
+CKPT="$ROOT/logs/3dgs/run16/20260515_141812/best_20260515_141812.pth
 "
-OUT_PREFIX="$ROOT/results/run15/run15"
+OUT_PREFIX="$ROOT/results/run16/run16"
 
 # Create output directory
-mkdir -p "$ROOT/results/run13"
+mkdir -p "$ROOT/results/run16"
 
 echo "=== Evaluating 3DGS: run_fewest_ellipsoids ==="
 echo "Checkpoint: $CKPT"

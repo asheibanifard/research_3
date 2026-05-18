@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from datetime import datetime
 from pathlib import Path
 from time import time
@@ -12,6 +13,19 @@ import numpy as np
 import tifffile
 import torch
 from tqdm import tqdm
+
+
+class _LogFile:
+    """Thin wrapper that writes to a .log file and optionally mirrors to stdout."""
+
+    def __init__(self, path: Path):
+        self._f = open(path, 'w', buffering=1)   # line-buffered
+
+    def write(self, line: str):
+        self._f.write(line + '\n')
+
+    def close(self):
+        self._f.close()
 
 
 def _load_volume(volume_path: str) -> tuple[torch.Tensor, float, float]:
@@ -37,6 +51,14 @@ def train_impl(
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir   = Path(cfg.out) / run_stamp
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    log = _LogFile(out_dir / "train.log")
+    log.write(f"# run  : {run_stamp}")
+    log.write(f"# cfg  : {cfg.out}")
+    log.write(f"# vol  : {cfg.volume}")
+    log.write(f"# date : {datetime.now().isoformat(timespec='seconds')}")
+    log.write(f"# {'epoch':>6}  {'step':>7}  {'loss':>9}  {'psnr':>7}  {'vol_psnr':>8}  "
+              f"{'N':>7}  {'s_mean':>7}  {'elapsed':>8}")
 
     print(f"Loading volume: {cfg.volume}")
     volume, vmin, vmax = _load_volume(cfg.volume)
@@ -107,11 +129,12 @@ def train_impl(
         for _ in range(cfg.steps_per_epoch):
             step += 1
 
-            pts, gt = dataset.sample(cfg.batch, device)
+            pts, gt, sample_weights = dataset.sample(cfg.batch, device, cfg=cfg)
 
             optimizer.zero_grad()
             pred = gc.forward(pts, chunk_n=cfg.chunk_n)
-            loss, stats = compute_loss(pred, gt, gc, cfg, dataset, step=step)
+            loss, stats = compute_loss(pred, gt, gc, cfg, dataset, step=step,
+                                       sample_weights=sample_weights)
 
             loss.backward()
             gc.accum_grads()
@@ -134,10 +157,10 @@ def train_impl(
                 n_pruned, n_added = gc.densify_and_prune(cfg)
                 optimizer = make_optimizer(gc, cfg)
                 update_lr(optimizer, step, total_steps, cfg)
-                tqdm.write(
-                    f"  [step {step:6d}] densify — "
-                    f"pruned {n_pruned:5d}  added {n_added:5d}  total {gc.N:6d}"
-                )
+                msg = (f"  [step {step:6d}] densify — "
+                       f"pruned {n_pruned:5d}  added {n_added:5d}  total {gc.N:6d}")
+                tqdm.write(msg)
+                log.write(f"# {msg.strip()}")
 
             if cfg.ckpt_interval > 0 and step % cfg.ckpt_interval == 0:
                 gc.save(out_dir / f"ckpt_{run_stamp}_{step:07d}.pth")
@@ -170,15 +193,22 @@ def train_impl(
             t=f'{elapsed/60:.1f}m',
         )
 
+        vol_psnr_str = ('     nan' if math.isnan(eval_metrics['vol_psnr'])
+                        else f"{eval_metrics['vol_psnr']:8.3f}")
+        log.write(
+            f"  {epoch+1:6d}  {step:7d}  {avg_loss:9.6f}  {last_psnr:7.3f}  "
+            f"{vol_psnr_str}  {gc.N:7d}  {s_mean:7.5f}  {elapsed/60:7.1f}m"
+        )
+
         if last_psnr > best_psnr:
             best_psnr = last_psnr
             bad_epochs = 0
             gc.save(best_path)
-            tqdm.write(
-                f"  ★ new best  epoch {epoch+1:4d}  "
-                f"PSNR={last_psnr:.2f} dB  N={gc.N}  "
-                f"t={elapsed/60:.1f} min"
-            )
+            best_msg = (f"  ★ new best  epoch {epoch+1:4d}  "
+                        f"PSNR={last_psnr:.2f} dB  N={gc.N}  "
+                        f"t={elapsed/60:.1f} min")
+            tqdm.write(best_msg)
+            log.write(f"# {best_msg.strip()}")
         else:
             bad_epochs += 1
             if cfg.early_stop_patience is not None and bad_epochs >= cfg.early_stop_patience:
@@ -198,5 +228,13 @@ def train_impl(
     with open(out_dir / "config.json", "w") as f:
         json.dump(vars(cfg), f, indent=2)
 
-    print(f"\nDone. Best PSNR = {best_psnr:.2f} dB  →  {best_path}")
+    total_min = (time() - t0) / 60
+    summary = f"\nDone. Best PSNR = {best_psnr:.2f} dB  →  {best_path}"
+    log.write(f"# finished : {datetime.now().isoformat(timespec='seconds')}")
+    log.write(f"# best PSNR: {best_psnr:.3f} dB")
+    log.write(f"# total    : {total_min:.1f} min")
+    log.write(f"# output   : {out_dir}")
+    log.close()
+
+    print(summary)
     return gc, log_entries
